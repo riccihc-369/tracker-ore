@@ -42,10 +42,10 @@ function safeJsonParse<T>(s: string | null, fallback: T): T {
 
 function csvEscape(value: unknown) {
   const s = String(value ?? "");
-  if (/[",\n]/.test(s)) return `"${s.replaceAll('"', '""')}"`;
-  return s;
+  const mustQuote =
+    s.includes('"') || s.includes(",") || s.includes("\n") || s.includes("\r");
+  return mustQuote ? `"${s.replaceAll('"', '""')}"` : s;
 }
-
 
 
 function cryptoRandomId() {
@@ -813,7 +813,7 @@ const styles = `
     console.assert(pad2(1) === "01", "pad2 failed");
     console.assert(minutesToHhMm(0) === "0h 00m", "minutesToHhMm(0) failed");
     console.assert(minutesToHhMm(61) === "1h 01m", "minutesToHhMm(61) failed");
-    console.assert(csvEscape('a"b').includes('""'), "csvEscape quote failed");
+    console.assert(csvEscape("a\nb") === '"a\nb"', "csvEscape LF failed");
     const id = cryptoRandomId();
     console.assert(typeof id === "string" && id.length > 5, "cryptoRandomId failed");
   } catch {
