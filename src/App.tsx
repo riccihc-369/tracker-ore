@@ -1,16 +1,27 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 
 /**
- * Tracker ore per progetti (Vite + React base, zero dipendenze esterne)
- * - Mobile-first (cards) + Desktop (tabella)
+ * Tracker ore per progetti (Vite + React)
+ *
+ * Modalità cronometro (per collaboratore):
+ * - Premi un progetto => avvia il timer di quel progetto (modalità Lavoro)
+ * - Premi TRASFERTA => avvia il timer del progetto in modalità Trasferta
+ * - Premi un altro progetto => ferma e salva il precedente, poi avvia il nuovo
+ * - Premi STOP => ferma e salva il progetto attivo
+ *
+ * Feature richieste:
+ * 1) 🔒 Blocco modifica minuti mentre il timer è attivo (sul progetto attivo)
+ * 2) 📊 Vista Giorno / Settimana / Mese / Anno + Team: Somma o Confronto
+ * 3) 👥 Multi-utente (separazione per collaboratore dentro la stessa workspace)
+ * 4) ✈️ TRASFERTA per progetto (conteggio separato e visibile nei riepiloghi + export)
+ *
+ * Persistenza + Sync:
  * - localStorage
- * - Export CSV (giorno)
- * - PWA: registra service worker (serve ./sw.js e manifest)
- * - Sync multi-dispositivo: opzionale via Supabase REST (tabella kv), last-write-wins
+ * - Sync multi-dispositivo opzionale via Supabase REST (tabella kv), last-write-wins (per-workspace)
  */
 
-const LS_KEY = "ore_progetti_vite_simple_v1";
-const SYNC_KEY = "ore_progetti_sync_vite_simple_v1";
+const LS_KEY = "ore_progetti_vite_multi_v4";
+const SYNC_KEY = "ore_progetti_sync_vite_simple_v2";
 
 function pad2(n: number) {
   return String(n).padStart(2, "0");
@@ -23,11 +34,55 @@ function isoDate(d: Date = new Date()) {
   return `${y}-${m}-${day}`;
 }
 
-function minutesToHhMm(totalMinutes: number) {
-  const m = Math.max(0, Math.round(Number(totalMinutes || 0)));
-  const hh = Math.floor(m / 60);
-  const mm = m % 60;
+function startOfWeekISO(dateISO: string) {
+  // Monday as first day
+  const [y, m, d] = dateISO.split("-").map(Number);
+  const dt = new Date(y, (m || 1) - 1, d || 1);
+  const dow = dt.getDay(); // 0..6 (Sun..Sat)
+  const diff = dow === 0 ? -6 : 1 - dow; // move to Monday
+  dt.setDate(dt.getDate() + diff);
+  return isoDate(dt);
+}
+
+function startOfMonthISO(dateISO: string) {
+  const [y, m] = dateISO.split("-").map(Number);
+  const dt = new Date(y, (m || 1) - 1, 1);
+  return isoDate(dt);
+}
+
+function startOfYearISO(dateISO: string) {
+  const [y] = dateISO.split("-").map(Number);
+  return `${y}-01-01`;
+}
+
+function endOfYearISO(dateISO: string) {
+  const [y] = dateISO.split("-").map(Number);
+  return `${y}-12-31`;
+}
+
+function addDaysISO(dateISO: string, deltaDays: number) {
+  const [y, m, d] = dateISO.split("-").map(Number);
+  const dt = new Date(y, (m || 1) - 1, d || 1);
+  dt.setDate(dt.getDate() + deltaDays);
+  return isoDate(dt);
+}
+
+function msToHhMm(totalMs: number) {
+  const ms = Math.max(0, Math.round(Number(totalMs || 0)));
+  const totalMinutes = Math.floor(ms / 60000);
+  const hh = Math.floor(totalMinutes / 60);
+  const mm = totalMinutes % 60;
   return `${hh}h ${pad2(mm)}m`;
+}
+
+function msToMinutesInt(totalMs: number) {
+  const ms = Math.max(0, Math.round(Number(totalMs || 0)));
+  return Math.floor(ms / 60000);
+}
+
+function minutesIntToMs(minutes: number) {
+  const m = Math.max(0, Math.floor(Number(minutes || 0)));
+  return m * 60000;
 }
 
 function safeJsonParse<T>(s: string | null, fallback: T): T {
@@ -42,11 +97,12 @@ function safeJsonParse<T>(s: string | null, fallback: T): T {
 
 function csvEscape(value: unknown) {
   const s = String(value ?? "");
-  const mustQuote =
-    s.includes('"') || s.includes(",") || s.includes("\n") || s.includes("\r");
-  return mustQuote ? `"${s.replaceAll('"', '""')}"` : s;
+  // Escape if it contains a double quote, comma, CR or LF.
+  // IMPORTANT: keep this regex on ONE LINE (no literal newlines), otherwise you'll get:
+  // SyntaxError: Unterminated regular expression
+  if (/["\n\r,]/.test(s)) return `"${s.replaceAll('"', '""')}"`;
+  return s;
 }
-
 
 function cryptoRandomId() {
   if (typeof crypto !== "undefined" && "randomUUID" in crypto) return crypto.randomUUID();
@@ -62,14 +118,78 @@ function formatDateTime(ts: number | null) {
   }
 }
 
+function clampNonNeg(n: number) {
+  return Math.max(0, Number.isFinite(n) ? n : 0);
+}
+
+function elapsedMs(startedAt: number | null, now: number) {
+  if (!startedAt) return 0;
+  return clampNonNeg(now - startedAt);
+}
+
+function applyElapsed(entryMs: number, startedAt: number | null, now: number) {
+  return clampNonNeg(entryMs) + elapsedMs(startedAt, now);
+}
+
+function digitsOnly(input: string) {
+  let out = "";
+  for (let i = 0; i < input.length; i++) {
+    const c = input.charCodeAt(i);
+    if (c >= 48 && c <= 57) out += input[i];
+  }
+  return out;
+}
+
+function trimTrailingSlash(url: string) {
+  return url.endsWith("/") ? url.slice(0, -1) : url;
+}
+
+/**
+ * Base URL robusto:
+ * - In Vite: import.meta.env.BASE_URL (es. "/tracker-ore/")
+ * - In altri ambienti/sandbox: fallback a "/" oppure a pathname della pagina.
+ */
+function normalizeBaseUrl(base: string) {
+  let b = String(base || "/");
+  if (!b.startsWith("/")) b = `/${b}`;
+  if (!b.endsWith("/")) b = `${b}/`;
+  return b;
+}
+
+function getRuntimeBaseUrl() {
+  // Evita crash se import.meta.env non esiste (alcuni sandbox / build non-Vite)
+  const viteBase = (import.meta as any)?.env?.BASE_URL as string | undefined;
+  if (viteBase) return normalizeBaseUrl(viteBase);
+
+  try {
+    const p = window.location.pathname || "/";
+    const dir = p.endsWith("/") ? p : p.slice(0, p.lastIndexOf("/") + 1);
+    return normalizeBaseUrl(dir);
+  } catch {
+    return "/";
+  }
+}
+
 type Project = { id: string; name: string };
-type Entry = { minutes: number; note: string };
+
+type Entry = { workMs: number; travelMs: number; note: string };
+
 type Day = { entries: Record<string, Entry> };
 
+type TimerMode = "work" | "travel";
+
+type ActiveTimer = { projectId: string | null; startedAt: number | null; mode: TimerMode };
+
+type User = { id: string; name: string };
+
+type UserState = { days: Record<string, Day>; active: ActiveTimer };
+
 type AppState = {
-  updatedAt: number; // ms
-  projects: Project[];
-  days: Record<string, Day>;
+  updatedAt: number;
+  users: User[];
+  currentUserId: string;
+  projectsByUser: Record<string, Project[]>;
+  perUser: Record<string, UserState>;
 };
 
 type SyncConfig = {
@@ -88,15 +208,36 @@ type SyncStatus = {
   lastPullAt: number | null;
 };
 
-const defaultState = (): AppState => ({
-  updatedAt: Date.now(),
-  projects: [
-    { id: cryptoRandomId(), name: "Admin / Email" },
+type ViewMode = "day" | "week" | "month" | "year";
+
+type ScopeMode = "me" | "all";
+
+type TeamMode = "sum" | "compare";
+
+type LayoutMode = "pdf" | "dettagli";
+
+const defaultState = (): AppState => {
+  const me: User = { id: cryptoRandomId(), name: "Utente 1" };
+  const myProjects: Project[] = [
     { id: cryptoRandomId(), name: "Progetto A" },
     { id: cryptoRandomId(), name: "Progetto B" },
-  ],
-  days: {},
-});
+    { id: cryptoRandomId(), name: "Progetto C" },
+    { id: cryptoRandomId(), name: "Progetto D" },
+    { id: cryptoRandomId(), name: "Progetto E" },
+  ];
+  return {
+    updatedAt: Date.now(),
+    users: [me],
+    currentUserId: me.id,
+    projectsByUser: { [me.id]: myProjects },
+    perUser: {
+      [me.id]: {
+        days: {},
+        active: { projectId: null, startedAt: null, mode: "work" as TimerMode },
+      },
+    },
+  };
+};
 
 const defaultSync = (): SyncConfig => ({
   supabaseUrl: "",
@@ -107,17 +248,170 @@ const defaultSync = (): SyncConfig => ({
   autoPullIntervalSec: 20,
 });
 
+function ensureUserState(s: AppState, userId: string): AppState {
+  const perUser = s.perUser || {};
+  const projectsByUser = s.projectsByUser || {};
+  return {
+    ...s,
+    perUser: {
+      ...perUser,
+      [userId]:
+        perUser[userId] || ({ days: {}, active: { projectId: null, startedAt: null, mode: "work" as TimerMode } } as UserState),
+    },
+    projectsByUser: {
+      ...projectsByUser,
+      [userId]: projectsByUser[userId] || [],
+    },
+  };
+}
+
+function migrateState(raw: any): AppState {
+  if (raw && typeof raw === "object" && Array.isArray(raw.users) && raw.perUser && raw.projectsByUser) {
+    const s: AppState = {
+      updatedAt: Number(raw.updatedAt || Date.now()),
+      users: raw.users,
+      currentUserId: String(raw.currentUserId || raw.users?.[0]?.id || ""),
+      projectsByUser: typeof raw.projectsByUser === "object" && raw.projectsByUser ? raw.projectsByUser : {},
+      perUser: typeof raw.perUser === "object" && raw.perUser ? raw.perUser : {},
+    };
+
+    if (!s.users.length) return defaultState();
+    if (!s.currentUserId || !s.users.some((u) => u.id === s.currentUserId)) s.currentUserId = s.users[0].id;
+
+    const nextPerUser: Record<string, UserState> = {};
+    const nextProjectsByUser: Record<string, Project[]> = { ...s.projectsByUser };
+
+    for (const u of s.users) {
+      if (!Array.isArray(nextProjectsByUser[u.id])) nextProjectsByUser[u.id] = [];
+
+      const userProjects = nextProjectsByUser[u.id] as Project[];
+      nextProjectsByUser[u.id] = userProjects
+        .filter((p) => p && typeof p === "object")
+        .map((p) => ({ id: String((p as any).id || cryptoRandomId()), name: String((p as any).name || "") }))
+        .filter((p) => p.name.trim().length > 0);
+
+      const us =
+        s.perUser[u.id] || ({ days: {}, active: { projectId: null, startedAt: null, mode: "work" as TimerMode } } as UserState);
+      const days = us.days && typeof us.days === "object" ? us.days : {};
+      const nextDays: Record<string, Day> = {};
+
+      for (const [date, day] of Object.entries(days)) {
+        const entries: Record<string, Entry> = {};
+        const e = (day as any)?.entries || {};
+        for (const [pid, entry] of Object.entries(e)) {
+          const ent: any = entry || {};
+
+          // Support legacy fields:
+          // - ms (single bucket)
+          // - workMs / travelMs
+          // - minutes (single bucket)
+          const workMs =
+            typeof ent.workMs === "number"
+              ? ent.workMs
+              : typeof ent.ms === "number"
+                ? ent.ms
+                : minutesIntToMs(ent.minutes || 0);
+          const travelMs = typeof ent.travelMs === "number" ? ent.travelMs : 0;
+
+          entries[String(pid)] = {
+            workMs: clampNonNeg(workMs),
+            travelMs: clampNonNeg(travelMs),
+            note: String(ent.note || ""),
+          };
+        }
+        nextDays[String(date)] = { entries };
+      }
+
+      let active: ActiveTimer = {
+        projectId: us.active?.projectId ?? null,
+        startedAt: us.active?.startedAt ?? null,
+        mode: (us.active?.mode as TimerMode) || "work",
+      };
+
+      if (active.projectId && !nextProjectsByUser[u.id].some((p) => p.id === active.projectId)) {
+        active = { projectId: null, startedAt: null, mode: "work" as TimerMode };
+      }
+      if (active.projectId && !active.startedAt) active = { projectId: null, startedAt: null, mode: "work" as TimerMode };
+
+      nextPerUser[u.id] = { days: nextDays, active };
+    }
+
+    const first = s.users[0];
+    if (!nextProjectsByUser[first.id] || nextProjectsByUser[first.id].length === 0) {
+      const base = defaultState();
+      nextProjectsByUser[first.id] = base.projectsByUser[base.users[0].id];
+    }
+
+    return { ...s, projectsByUser: nextProjectsByUser, perUser: nextPerUser };
+  }
+
+  // Legacy v1 single-user
+  if (raw && typeof raw === "object" && raw.active && raw.days && Array.isArray(raw.projects)) {
+    const base = defaultState();
+    const me = base.users[0];
+    return migrateState({
+      updatedAt: raw.updatedAt,
+      users: [me],
+      currentUserId: me.id,
+      projectsByUser: { [me.id]: raw.projects as Project[] },
+      perUser: { [me.id]: { days: raw.days, active: raw.active } },
+    });
+  }
+
+  return defaultState();
+}
+
+function rangeDatesISO(startISO: string, endISO: string) {
+  const out: string[] = [];
+  let cur = startISO;
+  for (let i = 0; i < 800; i++) {
+    out.push(cur);
+    if (cur === endISO) break;
+    cur = addDaysISO(cur, 1);
+  }
+  return out;
+}
+
+function StopWatchIcon({ filled }: { filled?: boolean }) {
+  return (
+    <svg width="54" height="54" viewBox="0 0 64 64" aria-hidden="true">
+      <path
+        d="M26 6h12v6H26V6zm6 10c-13.3 0-24 10.7-24 24s10.7 24 24 24 24-10.7 24-24S45.3 16 32 16zm0 6c10 0 18 8 18 18s-8 18-18 18-18-8-18-18 8-18 18-18zm-2 4h4v16h-4V26z"
+        fill={filled ? "var(--accent)" : "var(--accent)"}
+      />
+    </svg>
+  );
+}
+
+function FlagStopIcon() {
+  return (
+    <svg width="54" height="54" viewBox="0 0 64 64" aria-hidden="true">
+      <path
+        d="M14 6h4v52h-4V6zm6 4c10 0 14-4 24-4 8 0 12 2 12 2v28s-4-2-12-2c-10 0-14 4-24 4-4 0-6-1-6-1V11s2-1 6-1z"
+        fill="var(--accent)"
+      />
+    </svg>
+  );
+}
+
 export default function App() {
   const today = useMemo(() => isoDate(new Date()), []);
 
   const [state, setState] = useState<AppState>(() => {
     const raw = window.localStorage.getItem(LS_KEY);
-    return safeJsonParse<AppState>(raw, defaultState());
+    const parsed = safeJsonParse<any>(raw, null);
+    return migrateState(parsed);
   });
 
   const [selectedDate, setSelectedDate] = useState(today);
   const [newProjectName, setNewProjectName] = useState("");
   const [compact, setCompact] = useState(false);
+  const [view, setView] = useState<ViewMode>("day");
+  const [scope, setScope] = useState<ScopeMode>("me");
+  const [teamMode, setTeamMode] = useState<TeamMode>("compare");
+  const [layout, setLayout] = useState<LayoutMode>("pdf");
+
+  const [newUserName, setNewUserName] = useState("");
   const newProjectRef = useRef<HTMLInputElement | null>(null);
 
   const [sync, setSync] = useState<SyncConfig>(() => {
@@ -132,11 +426,12 @@ export default function App() {
     lastPullAt: null,
   });
 
+  const [nowTick, setNowTick] = useState(() => Date.now());
+
   const pushDebounceRef = useRef<number | null>(null);
   const autoPullTimerRef = useRef<number | null>(null);
   const lastAppliedCloudStampRef = useRef<number>(0);
 
-  // Persist local
   useEffect(() => {
     try {
       window.localStorage.setItem(LS_KEY, JSON.stringify(state));
@@ -153,11 +448,24 @@ export default function App() {
     }
   }, [sync]);
 
-  // PWA: register Service Worker
+  // PWA: registra Service Worker (robusto per GitHub Pages / base path)
   useEffect(() => {
+    const base = getRuntimeBaseUrl();
+
+    try {
+      const manifestLink = document.querySelector<HTMLLinkElement>('link[rel="manifest"]');
+      if (manifestLink) {
+        const wanted = `${base}manifest.webmanifest`;
+        if (manifestLink.getAttribute("href") !== wanted) manifestLink.setAttribute("href", wanted);
+      }
+    } catch {
+      // ignore
+    }
+
     if (!("serviceWorker" in navigator)) return;
-    // IMPORTANT for GitHub Pages: relative path
-    navigator.serviceWorker.register("./sw.js").catch(() => {
+
+    const swUrl = `${base}sw.js`;
+    navigator.serviceWorker.register(swUrl).catch(() => {
       /* ignore */
     });
   }, []);
@@ -166,54 +474,41 @@ export default function App() {
     setState((prev) => ({ ...updater(prev), updatedAt: Date.now() }));
   }
 
-  const dayData = useMemo(() => {
-    const day = state.days?.[selectedDate] || { entries: {} };
-    return { entries: day.entries || {} };
-  }, [state.days, selectedDate]);
+  const currentUser = useMemo(
+    () => state.users.find((x) => x.id === state.currentUserId) || state.users[0],
+    [state.currentUserId, state.users],
+  );
 
-  const totals = useMemo(() => {
-    let totalMinutes = 0;
-    const perProject: Record<string, number> = {};
-    for (const p of state.projects) {
-      const m = Number(dayData.entries?.[p.id]?.minutes || 0);
-      perProject[p.id] = m;
-      totalMinutes += m;
-    }
-    return { totalMinutes, perProject };
-  }, [state.projects, dayData.entries]);
+  const currentProjects = useMemo<Project[]>(
+    () => state.projectsByUser?.[currentUser.id] || [],
+    [state.projectsByUser, currentUser.id],
+  );
 
-  function ensureDay(date: string) {
-    setStateStamped((s) => {
-      if (s.days?.[date]) return s;
-      return {
-        ...s,
-        days: {
-          ...s.days,
-          [date]: { entries: {} },
-        },
-      };
-    });
-  }
+  const activeForCurrentUser = useMemo<ActiveTimer>(
+    () => state.perUser?.[currentUser.id]?.active || { projectId: null, startedAt: null, mode: "work" as TimerMode},
+    [state.perUser, currentUser.id],
+  );
 
   useEffect(() => {
-    ensureDay(selectedDate);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedDate]);
+    if (!activeForCurrentUser.projectId || !activeForCurrentUser.startedAt) return;
+    const t = window.setInterval(() => setNowTick(Date.now()), 1000);
+    return () => window.clearInterval(t);
+  }, [activeForCurrentUser.projectId, activeForCurrentUser.startedAt]);
 
-  function updateEntry(projectId: string, patch: Partial<Entry>) {
-    setStateStamped((s) => {
-      const prevDay = s.days?.[selectedDate] || { entries: {} };
-      const prevEntry: Entry = prevDay.entries?.[projectId] || { minutes: 0, note: "" };
-      const nextEntry: Entry = { ...prevEntry, ...patch };
+  function ensureDay(date: string, userId: string) {
+    setStateStamped((s0) => {
+      const s = ensureUserState(s0, userId);
+      const us = s.perUser[userId];
+      if (us?.days?.[date]) return s;
       return {
         ...s,
-        days: {
-          ...s.days,
-          [selectedDate]: {
-            ...prevDay,
-            entries: {
-              ...prevDay.entries,
-              [projectId]: nextEntry,
+        perUser: {
+          ...s.perUser,
+          [userId]: {
+            ...us,
+            days: {
+              ...(us?.days || {}),
+              [date]: { entries: {} },
             },
           },
         },
@@ -221,74 +516,459 @@ export default function App() {
     });
   }
 
-  function bumpMinutes(projectId: string, delta: number) {
-    const current = Number(dayData.entries?.[projectId]?.minutes || 0);
-    updateEntry(projectId, { minutes: Math.max(0, current + delta) });
+  useEffect(() => {
+    ensureDay(selectedDate, currentUser.id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedDate, currentUser.id]);
+
+  function getEntry(userId: string, dateISO: string, projectId: string): Entry {
+    const us = state.perUser?.[userId];
+    const day = us?.days?.[dateISO];
+    return day?.entries?.[projectId] || { workMs: 0, travelMs: 0, note: "" };
+  }
+
+  function getDisplayBuckets(userId: string, dateISO: string, projectId: string) {
+    const entry = getEntry(userId, dateISO, projectId);
+    const active = state.perUser?.[userId]?.active;
+
+    let workMs = clampNonNeg(entry.workMs);
+    let travelMs = clampNonNeg(entry.travelMs);
+
+    if (active?.projectId === projectId && active.startedAt) {
+      const add = elapsedMs(active.startedAt, nowTick);
+      if (active.mode === "travel") travelMs = clampNonNeg(travelMs + add);
+      else workMs = clampNonNeg(workMs + add);
+    }
+
+    return { workMs, travelMs, totalMs: clampNonNeg(workMs + travelMs) };
+  }
+
+  function getDateRangeForView(): { startISO: string; endISO: string; label: string } {
+    if (view === "day") return { startISO: selectedDate, endISO: selectedDate, label: selectedDate };
+    if (view === "week") {
+      const start = startOfWeekISO(selectedDate);
+      const end = addDaysISO(start, 6);
+      return { startISO: start, endISO: end, label: `Settimana ${start} → ${end}` };
+    }
+    if (view === "month") {
+      const start = startOfMonthISO(selectedDate);
+      const [y, m] = start.split("-").map(Number);
+      const endDt = new Date(y, m, 0);
+      const end = isoDate(endDt);
+      return { startISO: start, endISO: end, label: `Mese ${start.slice(0, 7)}` };
+    }
+    const start = startOfYearISO(selectedDate);
+    const end = endOfYearISO(selectedDate);
+    return { startISO: start, endISO: end, label: `Anno ${start.slice(0, 4)}` };
+  }
+
+  const viewRange = useMemo(() => getDateRangeForView(), [selectedDate, view]);
+
+  const projectNameUniverse = useMemo(() => {
+    const names = new Set<string>();
+    for (const u of state.users) {
+      const ps = state.projectsByUser?.[u.id] || [];
+      for (const p of ps) names.add(p.name);
+    }
+    return Array.from(names).sort((a, b) => a.localeCompare(b));
+  }, [state.users, state.projectsByUser]);
+
+  const totalsMe = useMemo(() => {
+    const dates = rangeDatesISO(viewRange.startISO, viewRange.endISO);
+    let totalWorkMs = 0;
+    let totalTravelMs = 0;
+    const perProject: Record<string, { workMs: number; travelMs: number; totalMs: number }> = {};
+
+    for (const p of currentProjects) {
+      let w = 0;
+      let t = 0;
+      for (const d of dates) {
+        const b = getDisplayBuckets(currentUser.id, d, p.id);
+        w += b.workMs;
+        t += b.travelMs;
+      }
+      perProject[p.id] = { workMs: w, travelMs: t, totalMs: w + t };
+      totalWorkMs += w;
+      totalTravelMs += t;
+    }
+
+    return { totalWorkMs, totalTravelMs, totalMs: totalWorkMs + totalTravelMs, perProject, dates };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentProjects, state.perUser, currentUser.id, viewRange.startISO, viewRange.endISO, nowTick]);
+
+  const totalsTeam = useMemo(() => {
+    const dates = rangeDatesISO(viewRange.startISO, viewRange.endISO);
+    const userIds = state.users.map((u) => u.id);
+
+    const matrix: Record<string, Record<string, { workMs: number; travelMs: number; totalMs: number }>> = {};
+    let grandWorkMs = 0;
+    let grandTravelMs = 0;
+
+    for (const pname of projectNameUniverse) {
+      matrix[pname] = {};
+      for (const uid of userIds) {
+        const ps = state.projectsByUser?.[uid] || [];
+        const proj = ps.find((p) => p.name === pname);
+
+        let w = 0;
+        let t = 0;
+        if (proj) {
+          for (const d of dates) {
+            const b = getDisplayBuckets(uid, d, proj.id);
+            w += b.workMs;
+            t += b.travelMs;
+          }
+        }
+
+        matrix[pname][uid] = { workMs: w, travelMs: t, totalMs: w + t };
+        grandWorkMs += w;
+        grandTravelMs += t;
+      }
+    }
+
+    const perUserTotal: Record<string, { workMs: number; travelMs: number; totalMs: number }> = {};
+    for (const uid of userIds) {
+      let w = 0;
+      let t = 0;
+      for (const pname of projectNameUniverse) {
+        w += matrix[pname][uid]?.workMs || 0;
+        t += matrix[pname][uid]?.travelMs || 0;
+      }
+      perUserTotal[uid] = { workMs: w, travelMs: t, totalMs: w + t };
+    }
+
+    return { dates, matrix, grandWorkMs, grandTravelMs, grandTotalMs: grandWorkMs + grandTravelMs, perUserTotal };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [state.users, state.projectsByUser, state.perUser, projectNameUniverse, viewRange.startISO, viewRange.endISO, nowTick]);
+
+  function updateEntry(userId: string, dateISO: string, projectId: string, patch: Partial<Entry>) {
+    setStateStamped((s0) => {
+      const s = ensureUserState(s0, userId);
+      const us = s.perUser[userId];
+      const prevDay = us.days?.[dateISO] || { entries: {} };
+      const prevEntry: Entry = (prevDay.entries?.[projectId] as Entry) || { workMs: 0, travelMs: 0, note: "" };
+
+      const nextEntry: Entry = {
+        workMs: patch.workMs !== undefined ? clampNonNeg(patch.workMs) : clampNonNeg(prevEntry.workMs),
+        travelMs: patch.travelMs !== undefined ? clampNonNeg(patch.travelMs) : clampNonNeg(prevEntry.travelMs),
+        note: patch.note !== undefined ? String(patch.note) : String(prevEntry.note || ""),
+      };
+
+      return {
+        ...s,
+        perUser: {
+          ...s.perUser,
+          [userId]: {
+            ...us,
+            days: {
+              ...us.days,
+              [dateISO]: {
+                ...prevDay,
+                entries: {
+                  ...prevDay.entries,
+                  [projectId]: nextEntry,
+                },
+              },
+            },
+          },
+        },
+      };
+    });
+  }
+
+  function bumpMs(userId: string, dateISO: string, projectId: string, deltaMs: number, bucket: TimerMode) {
+    setStateStamped((s0) => {
+      let s = ensureUserState(s0, userId);
+      const us = s.perUser[userId];
+      const prevDay = us.days?.[dateISO] || { entries: {} };
+      const prevEntry: Entry = (prevDay.entries?.[projectId] as Entry) || { workMs: 0, travelMs: 0, note: "" };
+
+      let nextWorkMs = clampNonNeg(prevEntry.workMs);
+      let nextTravelMs = clampNonNeg(prevEntry.travelMs);
+
+      // Se sto modificando il progetto attivo, materializzo l'elapsed prima (per coerenza)
+      let active = us.active;
+      if (active.projectId === projectId && active.startedAt) {
+        const add = elapsedMs(active.startedAt, Date.now());
+        if (active.mode === "travel") nextTravelMs = clampNonNeg(nextTravelMs + add);
+        else nextWorkMs = clampNonNeg(nextWorkMs + add);
+        active = { projectId, startedAt: Date.now(), mode: active.mode };
+      }
+
+      if (bucket === "travel") nextTravelMs = clampNonNeg(nextTravelMs + deltaMs);
+      else nextWorkMs = clampNonNeg(nextWorkMs + deltaMs);
+
+      return {
+        ...s,
+        perUser: {
+          ...s.perUser,
+          [userId]: {
+            ...us,
+            active,
+            days: {
+              ...us.days,
+              [dateISO]: {
+                ...prevDay,
+                entries: {
+                  ...prevDay.entries,
+                  [projectId]: { ...prevEntry, workMs: nextWorkMs, travelMs: nextTravelMs },
+                },
+              },
+            },
+          },
+        },
+      };
+    });
   }
 
   function addProject() {
     const name = newProjectName.trim();
     if (!name) return;
     const id = cryptoRandomId();
-    setStateStamped((s) => ({ ...s, projects: [{ id, name }, ...s.projects] }));
+
+    setStateStamped((s0) => {
+      const s = ensureUserState(s0, currentUser.id);
+      const cur = s.projectsByUser[currentUser.id] || [];
+      return {
+        ...s,
+        projectsByUser: {
+          ...s.projectsByUser,
+          [currentUser.id]: [{ id, name }, ...cur],
+        },
+      };
+    });
+
     setNewProjectName("");
     setTimeout(() => newProjectRef.current?.focus(), 0);
   }
 
   function removeProject(projectId: string) {
-    setStateStamped((s) => {
-      const nextProjects = s.projects.filter((p) => p.id !== projectId);
-      const nextDays: Record<string, Day> = { ...s.days };
-      for (const d of Object.keys(nextDays)) {
-        const dd = nextDays[d];
+    setStateStamped((s0) => {
+      const s = ensureUserState(s0, currentUser.id);
+      const nextProjects = (s.projectsByUser[currentUser.id] || []).filter((p) => p.id !== projectId);
+
+      const us = s.perUser[currentUser.id];
+      const nextDays: Record<string, Day> = { ...(us?.days || {}) };
+      for (const date of Object.keys(nextDays)) {
+        const dd = nextDays[date];
         if (dd?.entries?.[projectId]) {
           const e = { ...(dd.entries || {}) };
           delete e[projectId];
-          nextDays[d] = { ...dd, entries: e };
+          nextDays[date] = { ...dd, entries: e };
         }
       }
-      return { ...s, projects: nextProjects, days: nextDays };
-    });
-  }
 
-  function resetDay() {
-    setStateStamped((s) => {
-      const prevDay = s.days?.[selectedDate] || { entries: {} };
-      const nextEntries: Record<string, Entry> = { ...prevDay.entries };
-      for (const p of s.projects) {
-        if (nextEntries[p.id]) nextEntries[p.id] = { ...nextEntries[p.id], minutes: 0 };
-      }
+      const nextActive =
+        us.active?.projectId === projectId ? { projectId: null, startedAt: null, mode: "work" as TimerMode } : us.active;
+
       return {
         ...s,
-        days: {
-          ...s.days,
-          [selectedDate]: { ...prevDay, entries: nextEntries },
+        projectsByUser: { ...s.projectsByUser, [currentUser.id]: nextProjects },
+        perUser: {
+          ...s.perUser,
+          [currentUser.id]: { ...us, days: nextDays, active: nextActive },
         },
       };
     });
   }
 
+  function resetDay() {
+    setStateStamped((s0) => {
+      const s = ensureUserState(s0, currentUser.id);
+      const uid = currentUser.id;
+      const us = s.perUser[uid];
+      const prevDay = us.days?.[selectedDate] || { entries: {} };
+      const nextEntries: Record<string, Entry> = { ...prevDay.entries };
+
+      for (const p of s.projectsByUser[uid] || []) {
+        if (nextEntries[p.id]) nextEntries[p.id] = { ...nextEntries[p.id], workMs: 0, travelMs: 0 };
+      }
+
+      return {
+        ...s,
+        perUser: {
+          ...s.perUser,
+          [uid]: {
+            ...us,
+            days: {
+              ...us.days,
+              [selectedDate]: { ...prevDay, entries: nextEntries },
+            },
+          },
+        },
+      };
+    });
+  }
+
+  function materializeActiveIfNeeded(s: AppState, userId: string, dateISO: string, now: number): AppState {
+    const us = s.perUser?.[userId];
+    if (!us) return s;
+
+    const { projectId, startedAt, mode } = us.active;
+    if (!projectId || !startedAt) return s;
+
+    const prevDay = us.days?.[dateISO] || { entries: {} };
+    const prevEntry: Entry = (prevDay.entries?.[projectId] as Entry) || { workMs: 0, travelMs: 0, note: "" };
+
+    const nextWorkMs = mode === "work" ? applyElapsed(prevEntry.workMs, startedAt, now) : clampNonNeg(prevEntry.workMs);
+    const nextTravelMs =
+      mode === "travel" ? applyElapsed(prevEntry.travelMs, startedAt, now) : clampNonNeg(prevEntry.travelMs);
+
+    return {
+      ...s,
+      perUser: {
+        ...s.perUser,
+        [userId]: {
+          ...us,
+          active: { projectId: null, startedAt: null, mode: "work" as TimerMode},
+          days: {
+            ...us.days,
+            [dateISO]: {
+              ...prevDay,
+              entries: {
+                ...prevDay.entries,
+                [projectId]: { ...prevEntry, workMs: nextWorkMs, travelMs: nextTravelMs },
+              },
+            },
+          },
+        },
+      },
+    };
+  }
+
+  function startProject(projectId: string, mode: TimerMode) {
+    const now = Date.now();
+    setStateStamped((s0) => {
+      let s = ensureUserState(s0, currentUser.id);
+      const uid = currentUser.id;
+      const us = s.perUser[uid];
+
+      if (us.active.projectId === projectId && us.active.startedAt && us.active.mode === mode) return s;
+
+      // stop previous (if any) on selectedDate
+      s = materializeActiveIfNeeded(s, uid, selectedDate, now);
+
+      // start new
+      const nextUs = s.perUser[uid];
+      return {
+        ...s,
+        perUser: {
+          ...s.perUser,
+          [uid]: {
+            ...nextUs,
+            active: { projectId, startedAt: now, mode },
+          },
+        },
+      };
+    });
+  }
+
+  function stopActive() {
+    const now = Date.now();
+    setStateStamped((s0) => materializeActiveIfNeeded(s0, currentUser.id, selectedDate, now));
+  }
+
   function exportCsv() {
-    const header = ["Data", "Progetto", "Minuti", "Ore", "Note"];
+    // CSV è perfetto per Excel (Importa da file). Se vuoi, in futuro possiamo generare XLSX nativo.
+    const header = [
+      "Range",
+      "Data",
+      "Collaboratore",
+      "Progetto",
+      "Minuti lavoro",
+      "Minuti trasferta",
+      "Minuti totali",
+      "Ore totali",
+      "Note",
+    ];
     const rows: string[][] = [header];
 
-    for (const p of state.projects) {
-      const entry = dayData.entries?.[p.id] || { minutes: 0, note: "" };
-      const minutes = Number(entry.minutes || 0);
-      const ore = (minutes / 60).toFixed(2);
-      rows.push([selectedDate, p.name, String(minutes), ore, entry.note || ""]);
+    const dates = rangeDatesISO(viewRange.startISO, viewRange.endISO);
+
+    for (const u of state.users) {
+      const ps = state.projectsByUser?.[u.id] || [];
+      for (const dateISO of dates) {
+        for (const p of ps) {
+          const entry = getEntry(u.id, dateISO, p.id);
+          const b = getDisplayBuckets(u.id, dateISO, p.id);
+          const mWork = msToMinutesInt(b.workMs);
+          const mTravel = msToMinutesInt(b.travelMs);
+          const mTot = mWork + mTravel;
+          const ore = (mTot / 60).toFixed(2);
+          rows.push([
+            viewRange.label,
+            dateISO,
+            u.name,
+            p.name,
+            String(mWork),
+            String(mTravel),
+            String(mTot),
+            ore,
+            entry.note || "",
+          ]);
+        }
+      }
     }
 
     const csv = rows.map((r) => r.map(csvEscape).join(",")).join("\n");
+
     const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
-    a.download = `ore_progetti_${selectedDate}.csv`;
+    a.download = `ore_progetti_${view}_${scope}_${selectedDate}.csv`;
     document.body.appendChild(a);
     a.click();
     a.remove();
     URL.revokeObjectURL(url);
+  }
+
+  function addUser() {
+    const name = newUserName.trim();
+    if (!name) return;
+    const id = cryptoRandomId();
+
+    setStateStamped((s0) => {
+      let s = ensureUserState(s0, id);
+      const template = (s.projectsByUser[currentUser.id] || []).map((p) => ({ id: cryptoRandomId(), name: p.name }));
+
+      return {
+        ...s,
+        users: [...s.users, { id, name }],
+        projectsByUser: {
+          ...s.projectsByUser,
+          [id]: template,
+        },
+        perUser: {
+          ...s.perUser,
+          [id]: s.perUser[id] || { days: {}, active: { projectId: null, startedAt: null, mode: "work" as TimerMode} },
+        },
+      };
+    });
+
+    setNewUserName("");
+  }
+
+  function removeUser(userId: string) {
+    setStateStamped((s0) => {
+      if (s0.users.length <= 1) return s0;
+      const nextUsers = s0.users.filter((u) => u.id !== userId);
+
+      const nextPerUser = { ...(s0.perUser || {}) };
+      delete nextPerUser[userId];
+
+      const nextProjectsByUser = { ...(s0.projectsByUser || {}) };
+      delete nextProjectsByUser[userId];
+
+      const nextCurrent = s0.currentUserId === userId ? nextUsers[0].id : s0.currentUserId;
+      return {
+        ...s0,
+        users: nextUsers,
+        perUser: nextPerUser,
+        projectsByUser: nextProjectsByUser,
+        currentUserId: nextCurrent,
+      };
+    });
   }
 
   // ----------------------
@@ -301,7 +981,7 @@ export default function App() {
 
   async function supabaseUpsert(payload: AppState) {
     const { supabaseUrl, supabaseAnonKey, workspaceKey } = sync;
-    const base = supabaseUrl.replace(/\/$/, "");
+    const base = trimTrailingSlash(supabaseUrl);
     const url = `${base}/rest/v1/kv`;
 
     const res = await fetch(url, {
@@ -327,7 +1007,7 @@ export default function App() {
 
   async function supabaseGet(): Promise<AppState | null> {
     const { supabaseUrl, supabaseAnonKey, workspaceKey } = sync;
-    const base = supabaseUrl.replace(/\/$/, "");
+    const base = trimTrailingSlash(supabaseUrl);
     const url = `${base}/rest/v1/kv?key=eq.${encodeURIComponent(workspaceKey)}&select=value`;
 
     const res = await fetch(url, {
@@ -345,7 +1025,7 @@ export default function App() {
 
     const rows = (await res.json().catch(() => [])) as Array<{ value?: AppState }>;
     if (!rows?.length) return null;
-    return rows[0]?.value || null;
+    return migrateState(rows[0]?.value);
   }
 
   async function pushToCloud() {
@@ -374,14 +1054,18 @@ export default function App() {
     try {
       const cloud = await supabaseGet();
       if (!cloud) {
-        setSyncStatus((s) => ({ ...s, state: "ok", message: "Nessun dato nel cloud per questa workspace.", lastPullAt: Date.now() }));
+        setSyncStatus((s) => ({
+          ...s,
+          state: "ok",
+          message: "Nessun dato nel cloud per questa workspace.",
+          lastPullAt: Date.now(),
+        }));
         return;
       }
 
       const cloudStamp = Number(cloud.updatedAt || 0);
       const localStamp = Number(state.updatedAt || 0);
 
-      // last-write-wins
       if (cloudStamp > localStamp) {
         setState(cloud);
         lastAppliedCloudStampRef.current = cloudStamp;
@@ -399,7 +1083,6 @@ export default function App() {
     }
   }
 
-  // Auto-push (debounced)
   useEffect(() => {
     if (!sync.autoPush) return;
     if (!isSyncConfigured()) return;
@@ -417,7 +1100,6 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [state, sync.autoPush, sync.supabaseUrl, sync.supabaseAnonKey, sync.workspaceKey]);
 
-  // Auto-pull (poll)
   useEffect(() => {
     if (!sync.autoPull) return;
     if (!isSyncConfigured()) return;
@@ -437,6 +1119,47 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sync.autoPull, sync.autoPullIntervalSec, sync.supabaseUrl, sync.supabaseAnonKey, sync.workspaceKey]);
 
+  const activeProjectName = useMemo(() => {
+    const pid = activeForCurrentUser.projectId;
+    if (!pid) return null;
+    return currentProjects.find((p) => p.id === pid)?.name || null;
+  }, [activeForCurrentUser.projectId, currentProjects]);
+
+  const isAnyTimerRunningForCurrentUser = Boolean(activeForCurrentUser.projectId && activeForCurrentUser.startedAt);
+
+  function exportTeamCompareCsv() {
+    const header = ["Range", "Progetto", ...state.users.map((u) => `${u.name} (tot)`), "Totale", "Trasferta (team)"];
+    const rows: string[][] = [header];
+
+    for (const pname of projectNameUniverse) {
+      const row: string[] = [viewRange.label, pname];
+      let sum = 0;
+      let sumTravel = 0;
+      for (const u of state.users) {
+        const b = totalsTeam.matrix[pname]?.[u.id] || { workMs: 0, travelMs: 0, totalMs: 0 };
+        sum += b.totalMs;
+        sumTravel += b.travelMs;
+        row.push(msToHhMm(b.totalMs));
+      }
+      row.push(msToHhMm(sum));
+      row.push(msToHhMm(sumTravel));
+      rows.push(row);
+    }
+
+    const csv = rows.map((r) => r.map(csvEscape).join(",")).join("\n");
+    const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `ore_team_compare_${view}_${selectedDate}.csv`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  }
+
+  const titleUser = currentUser?.name || "Utente";
+
   return (
     <div className="app">
       <style>{styles}</style>
@@ -444,7 +1167,7 @@ export default function App() {
       <header className="topbar">
         <div>
           <div className="title">Tracker ore per progetti</div>
-          <div className="subtitle">Vite + React base • local + sync Supabase (opzionale) • last-write-wins</div>
+          <div className="subtitle">Cronometro per progetto • local + sync Supabase (opzionale) • last-write-wins</div>
         </div>
 
         <div className="toolbar">
@@ -453,253 +1176,567 @@ export default function App() {
             <input type="date" value={selectedDate} onChange={(e) => setSelectedDate(e.target.value)} />
           </label>
 
+          <label className="field">
+            <span>Vista</span>
+            <select value={view} onChange={(e) => setView(e.target.value as ViewMode)}>
+              <option value="day">Giorno</option>
+              <option value="week">Settimana</option>
+              <option value="month">Mese</option>
+              <option value="year">Anno</option>
+            </select>
+          </label>
+
+          <label className="field">
+            <span>Scope</span>
+            <select
+              value={scope}
+              onChange={(e) => {
+                const next = e.target.value as ScopeMode;
+                setScope(next);
+                if (next === "all") setTeamMode("compare");
+              }}
+            >
+              <option value="me">Solo io</option>
+              <option value="all">Team</option>
+            </select>
+          </label>
+
+          {scope === "all" && (
+            <label className="field">
+              <span>Team mode</span>
+              <select value={teamMode} onChange={(e) => setTeamMode(e.target.value as TeamMode)}>
+                <option value="sum">Somma</option>
+                <option value="compare">Confronto</option>
+              </select>
+            </label>
+          )}
+
+          {scope === "me" && (
+            <label className="field">
+              <span>Layout</span>
+              <select value={layout} onChange={(e) => setLayout(e.target.value as LayoutMode)}>
+                <option value="pdf">Design PDF</option>
+                <option value="dettagli">Dettagli</option>
+              </select>
+            </label>
+          )}
+
+          <button
+            className={isAnyTimerRunningForCurrentUser ? "btn danger" : "btn"}
+            onClick={stopActive}
+            disabled={!isAnyTimerRunningForCurrentUser || scope === "all"}
+          >
+            STOP
+          </button>
+
           <button className="btn" onClick={() => setCompact((v) => !v)}>
             {compact ? "Mostra dettagli" : "Compatta"}
           </button>
-          <button className="btn" onClick={exportCsv}>Esporta CSV</button>
-          <button className="btn danger" onClick={resetDay}>Reset giorno</button>
+
+          <button className="btn" onClick={exportCsv}>
+            Esporta CSV
+          </button>
+
+          {scope === "all" && teamMode === "compare" && (
+            <button className="btn" onClick={exportTeamCompareCsv}>
+              CSV confronto
+            </button>
+          )}
+
+          <button className="btn" onClick={resetDay} disabled={scope === "all"}>
+            Reset giorno
+          </button>
+        </div>
+
+        <div className="activeStrip">
+          <div className="userPill">
+            <span className="muted small">Collaboratore</span>
+            <select
+              value={state.currentUserId}
+              onChange={(e) => setStateStamped((s) => ({ ...s, currentUserId: e.target.value }))}
+            >
+              {state.users.map((u) => (
+                <option key={u.id} value={u.id}>
+                  {u.name}
+                </option>
+              ))}
+            </select>
+          </div>
+
+          {isAnyTimerRunningForCurrentUser && scope === "me" && (
+            <>
+              <span className="badge">
+                Attivo: {activeProjectName || "(sconosciuto)"} • {activeForCurrentUser.mode === "travel" ? "TRASFERTA" : "LAVORO"}
+              </span>
+              <span className="muted small">Avviato: {formatDateTime(activeForCurrentUser.startedAt)}</span>
+            </>
+          )}
+
+          {scope === "all" && (
+            <>
+              <span className="badge outline">{viewRange.label}</span>
+              <span className="muted small">
+                Totale team: {msToHhMm(totalsTeam.grandTotalMs)} • Trasferta: {msToHhMm(totalsTeam.grandTravelMs)}
+              </span>
+            </>
+          )}
         </div>
       </header>
 
       <main className="grid">
-        <section className="card span2">
-          <div className="cardHeader">
-            <div className="cardTitle">Progetti</div>
-            <div className="addRow">
-              <input
-                ref={newProjectRef}
-                value={newProjectName}
-                onChange={(e) => setNewProjectName(e.target.value)}
-                placeholder="Aggiungi progetto (es. Cliente X)"
-                onKeyDown={(e) => {
-                  if (e.key === "Enter") addProject();
-                }}
-              />
-              <button className="btn primary" onClick={addProject}>Aggiungi</button>
-            </div>
-          </div>
+        <section className={layout === "pdf" ? "card span2 pdf" : "card span2"}>
+          {scope === "all" ? (
+            <div className="teamWrap">
+              <div className="sectionTitle">Team • {viewRange.label}</div>
 
-          {/* Desktop table */}
-          <div className="desktopOnly">
-            <div className="tableWrap">
-              <table className="table">
-                <thead>
-                  <tr>
-                    <th>Progetto</th>
-                    <th className="right">Minuti</th>
-                    <th>Azioni rapide</th>
-                    <th>Totale</th>
-                    <th className="right"> </th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {state.projects.map((p) => {
-                    const entry = dayData.entries?.[p.id] || { minutes: 0, note: "" };
-                    const minutes = Number(entry.minutes || 0);
-                    return (
-                      <tr key={p.id}>
-                        <td>
-                          <div className="projName">{p.name}</div>
-                          {!compact && (
-                            <input
-                              value={entry.note || ""}
-                              onChange={(e) => updateEntry(p.id, { note: e.target.value })}
-                              placeholder="Note (opzionale)"
-                            />
-                          )}
-                        </td>
-                        <td className="right">
-                          <input
-                            inputMode="numeric"
-                            value={String(minutes)}
-                            onChange={(e) => {
-                              const v = e.target.value.replace(/[^0-9]/g, "");
-                              updateEntry(p.id, { minutes: v === "" ? 0 : Number(v) });
-                            }}
-                            className="num"
-                          />
-                          {!compact && <div className="muted small">{(minutes / 60).toFixed(2)} ore</div>}
-                        </td>
-                        <td>
-                          <div className="quick">
-                            <button className="chip" onClick={() => bumpMinutes(p.id, 15)}>+15m</button>
-                            <button className="chip" onClick={() => bumpMinutes(p.id, 30)}>+30m</button>
-                            <button className="chip" onClick={() => bumpMinutes(p.id, 60)}>+1h</button>
-                            <button className="chip" onClick={() => bumpMinutes(p.id, -15)}>-15m</button>
-                          </div>
-                        </td>
-                        <td>
-                          <span className="badge">{minutesToHhMm(minutes)}</span>
-                          {!compact && entry.note ? <div className="muted small clamp2">{entry.note}</div> : null}
-                        </td>
-                        <td className="right">
-                          <button className="btn ghost" onClick={() => removeProject(p.id)} aria-label={`Elimina ${p.name}`}>
-                            Elimina
-                          </button>
-                        </td>
-                      </tr>
-                    );
-                  })}
-                </tbody>
-              </table>
-            </div>
-          </div>
-
-          {/* Mobile cards */}
-          <div className="mobileOnly">
-            <div className="cards">
-              {state.projects.map((p) => {
-                const entry = dayData.entries?.[p.id] || { minutes: 0, note: "" };
-                const minutes = Number(entry.minutes || 0);
-                return (
-                  <div className="rowCard" key={p.id}>
-                    <div className="rowTop">
-                      <div className="projName">{p.name}</div>
-                      <button className="btn ghost" onClick={() => removeProject(p.id)}>Elimina</button>
+              {teamMode === "sum" ? (
+                <>
+                  <div className="kv">
+                    <div className="kvRow">
+                      <span className="muted">Totale lavoro</span>
+                      <span>{msToHhMm(totalsTeam.grandWorkMs)}</span>
                     </div>
-
-                    <div className="rowMid">
-                      <span className="badge">{minutesToHhMm(minutes)}</span>
-                      <span className="muted small">{(minutes / 60).toFixed(2)} ore</span>
+                    <div className="kvRow">
+                      <span className="muted">Totale trasferta</span>
+                      <span>{msToHhMm(totalsTeam.grandTravelMs)}</span>
                     </div>
-
-                    <div className="rowInputs">
-                      <input
-                        inputMode="numeric"
-                        value={String(minutes)}
-                        onChange={(e) => {
-                          const v = e.target.value.replace(/[^0-9]/g, "");
-                          updateEntry(p.id, { minutes: v === "" ? 0 : Number(v) });
-                        }}
-                        className="num big"
-                      />
-
-                      {!compact && (
-                        <input
-                          value={entry.note || ""}
-                          onChange={(e) => updateEntry(p.id, { note: e.target.value })}
-                          placeholder="Note (opzionale)"
-                        />
-                      )}
-
-                      <div className="quickGrid">
-                        <button className="chip big" onClick={() => bumpMinutes(p.id, 15)}>+15</button>
-                        <button className="chip big" onClick={() => bumpMinutes(p.id, 30)}>+30</button>
-                        <button className="chip big" onClick={() => bumpMinutes(p.id, 60)}>+1h</button>
-                        <button className="chip big" onClick={() => bumpMinutes(p.id, -15)}>-15</button>
-                      </div>
+                    <div className="kvRow">
+                      <span className="muted">Totale complessivo</span>
+                      <span>{msToHhMm(totalsTeam.grandTotalMs)}</span>
                     </div>
                   </div>
-                );
-              })}
-            </div>
-          </div>
 
-          <div className="footerRow">
-            <div className="muted">Suggerimento: usa +15m/+30m/+1h mentre lavori.</div>
-            <div className="badge outline">Totale giorno: {minutesToHhMm(totals.totalMinutes)}</div>
-          </div>
+                  <div className="tableWrap">
+                    <table className="table">
+                      <thead>
+                        <tr>
+                          <th>Progetto</th>
+                          <th className="num">Lavoro</th>
+                          <th className="num">Trasferta</th>
+                          <th className="num">Totale</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {projectNameUniverse.map((pname) => {
+                          let w = 0;
+                          let t = 0;
+                          for (const u of state.users) {
+                            w += totalsTeam.matrix[pname]?.[u.id]?.workMs || 0;
+                            t += totalsTeam.matrix[pname]?.[u.id]?.travelMs || 0;
+                          }
+                          const tot = w + t;
+                          if (!tot) return null;
+                          return (
+                            <tr key={pname}>
+                              <td className="truncate">{pname}</td>
+                              <td className="num">{msToHhMm(w)}</td>
+                              <td className="num">{msToHhMm(t)}</td>
+                              <td className="num strong">{msToHhMm(tot)}</td>
+                            </tr>
+                          );
+                        })}
+                        {projectNameUniverse.every((pname) => {
+                          let sum = 0;
+                          for (const u of state.users) sum += totalsTeam.matrix[pname]?.[u.id]?.totalMs || 0;
+                          return sum === 0;
+                        }) && (
+                          <tr>
+                            <td colSpan={4} className="muted small">
+                              Nessun dato nel periodo.
+                            </td>
+                          </tr>
+                        )}
+                      </tbody>
+                    </table>
+                  </div>
+                </>
+              ) : (
+                <>
+                  <div className="muted small">Confronto ore per progetto e collaboratore (CSV confronto disponibile).</div>
+                  <div className="tableWrap">
+                    <table className="table">
+                      <thead>
+                        <tr>
+                          <th>Progetto</th>
+                          {state.users.map((u) => (
+                            <th key={u.id} className="num">{u.name}</th>
+                          ))}
+                          <th className="num">Totale</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {projectNameUniverse.map((pname) => {
+                          const cells = state.users.map((u) => totalsTeam.matrix[pname]?.[u.id]?.totalMs || 0);
+                          const rowSum = cells.reduce((a, b) => a + b, 0);
+                          if (!rowSum) return null;
+                          return (
+                            <tr key={pname}>
+                              <td className="truncate">{pname}</td>
+                              {cells.map((ms, idx) => (
+                                <td key={state.users[idx].id} className="num">{msToHhMm(ms)}</td>
+                              ))}
+                              <td className="num strong">{msToHhMm(rowSum)}</td>
+                            </tr>
+                          );
+                        })}
+                        {projectNameUniverse.every((pname) => {
+                          let sum = 0;
+                          for (const u of state.users) sum += totalsTeam.matrix[pname]?.[u.id]?.totalMs || 0;
+                          return sum === 0;
+                        }) && (
+                          <tr>
+                            <td colSpan={state.users.length + 2} className="muted small">
+                              Nessun dato nel periodo.
+                            </td>
+                          </tr>
+                        )}
+                      </tbody>
+                    </table>
+                  </div>
+                </>
+              )}
+            </div>
+          ) : layout === "pdf" ? (
+            <div className="pdfWrap">
+              <div className="pdfHead">
+                <div>
+                  <div className="pdfTitle">{titleUser}</div>
+                  <div className="pdfDate">{selectedDate}</div>
+                </div>
+                <div className="pdfTotals">
+                  <div className="pdfTotalRow">
+                    <span className="muted">Lavoro</span>
+                    <span className="strong">{msToHhMm(totalsMe.totalWorkMs)}</span>
+                  </div>
+                  <div className="pdfTotalRow">
+                    <span className="muted">Trasferta</span>
+                    <span className="strong">{msToHhMm(totalsMe.totalTravelMs)}</span>
+                  </div>
+                  <div className="pdfTotalRow">
+                    <span className="muted">Totale</span>
+                    <span className="strong">{msToHhMm(totalsMe.totalMs)}</span>
+                  </div>
+                </div>
+              </div>
+
+              <div className={compact ? "pdfList compact" : "pdfList"}>
+                {currentProjects.map((p) => {
+                  const b = getDisplayBuckets(currentUser.id, selectedDate, p.id);
+                  const isActive = activeForCurrentUser.projectId === p.id && !!activeForCurrentUser.startedAt;
+                  const activeMode = isActive ? activeForCurrentUser.mode : null;
+
+                  return (
+                    <div key={p.id} className={isActive ? "pdfRow active" : "pdfRow"}>
+                      <div className="pdfLeft">
+                        <div className="pdfProjName">{p.name}</div>
+                        <div className="pdfMeta">
+                          <span className="pill">Lavoro: {msToHhMm(b.workMs)}</span>
+                          <span className="pill">Trasferta: {msToHhMm(b.travelMs)}</span>
+                          <span className="pill strong">Totale: {msToHhMm(b.totalMs)}</span>
+                        </div>
+                      </div>
+
+                      <div className="pdfBtns">
+                        <button
+                          className={isActive && activeMode === "work" ? "bigBtn on" : "bigBtn"}
+                          onClick={() => startProject(p.id, "work")}
+                          type="button"
+                        >
+                          <StopWatchIcon filled={isActive && activeMode === "work"} />
+                          <div className="bigLabel">Lavoro</div>
+                        </button>
+
+                        <button
+                          className={isActive && activeMode === "travel" ? "bigBtn on" : "bigBtn"}
+                          onClick={() => startProject(p.id, "travel")}
+                          type="button"
+                        >
+                          <FlagStopIcon />
+                          <div className="bigLabel">Trasferta</div>
+                        </button>
+                      </div>
+
+                      {!compact && (
+                        <div className="pdfEdit">
+                          <div className="editBlock">
+                            <div className="editLabel">Minuti lavoro</div>
+                            <div className="editRow">
+                              <button
+                                className="mini"
+                                disabled={isActive}
+                                onClick={() => bumpMs(currentUser.id, selectedDate, p.id, -15 * 60000, "work")}
+                              >
+                                −15
+                              </button>
+                              <input
+                                className="minutes"
+                                inputMode="numeric"
+                                value={String(msToMinutesInt(getEntry(currentUser.id, selectedDate, p.id).workMs))}
+                                disabled={isActive}
+                                onChange={(e) => {
+                                  const v = Number(digitsOnly(e.target.value));
+                                  updateEntry(currentUser.id, selectedDate, p.id, { workMs: minutesIntToMs(v) });
+                                }}
+                              />
+                              <button
+                                className="mini"
+                                disabled={isActive}
+                                onClick={() => bumpMs(currentUser.id, selectedDate, p.id, 15 * 60000, "work")}
+                              >
+                                +15
+                              </button>
+                            </div>
+                            {isActive && <div className="muted tiny">🔒 bloccato mentre il timer è attivo</div>}
+                          </div>
+
+                          <div className="editBlock">
+                            <div className="editLabel">Minuti trasferta</div>
+                            <div className="editRow">
+                              <button
+                                className="mini"
+                                disabled={isActive}
+                                onClick={() => bumpMs(currentUser.id, selectedDate, p.id, -15 * 60000, "travel")}
+                              >
+                                −15
+                              </button>
+                              <input
+                                className="minutes"
+                                inputMode="numeric"
+                                value={String(msToMinutesInt(getEntry(currentUser.id, selectedDate, p.id).travelMs))}
+                                disabled={isActive}
+                                onChange={(e) => {
+                                  const v = Number(digitsOnly(e.target.value));
+                                  updateEntry(currentUser.id, selectedDate, p.id, { travelMs: minutesIntToMs(v) });
+                                }}
+                              />
+                              <button
+                                className="mini"
+                                disabled={isActive}
+                                onClick={() => bumpMs(currentUser.id, selectedDate, p.id, 15 * 60000, "travel")}
+                              >
+                                +15
+                              </button>
+                            </div>
+                          </div>
+
+                          <div className="editBlock wide">
+                            <div className="editLabel">Nota</div>
+                            <textarea
+                              className="note"
+                              rows={2}
+                              value={getEntry(currentUser.id, selectedDate, p.id).note}
+                              onChange={(e) => updateEntry(currentUser.id, selectedDate, p.id, { note: e.target.value })}
+                              placeholder="Nota (opzionale)"
+                            />
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+
+                {currentProjects.length === 0 && <div className="muted small">Nessun progetto. Aggiungine uno a destra.</div>}
+              </div>
+            </div>
+          ) : (
+            <div className="detailWrap">
+              <div className="sectionTitle">Dettagli • {viewRange.label}</div>
+              <div className="kv">
+                <div className="kvRow">
+                  <span className="muted">Lavoro</span>
+                  <span>{msToHhMm(totalsMe.totalWorkMs)}</span>
+                </div>
+                <div className="kvRow">
+                  <span className="muted">Trasferta</span>
+                  <span>{msToHhMm(totalsMe.totalTravelMs)}</span>
+                </div>
+                <div className="kvRow">
+                  <span className="muted">Totale</span>
+                  <span className="strong">{msToHhMm(totalsMe.totalMs)}</span>
+                </div>
+              </div>
+
+              <div className="tableWrap">
+                <table className="table">
+                  <thead>
+                    <tr>
+                      <th>Progetto</th>
+                      <th className="num">Lavoro</th>
+                      <th className="num">Trasferta</th>
+                      <th className="num">Totale</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {currentProjects.map((p) => {
+                      let w = 0;
+                      let t = 0;
+                      for (const d of totalsMe.dates) {
+                        const b = getDisplayBuckets(currentUser.id, d, p.id);
+                        w += b.workMs;
+                        t += b.travelMs;
+                      }
+                      const tot = w + t;
+                      return (
+                        <tr key={p.id}>
+                          <td className="truncate">{p.name}</td>
+                          <td className="num">{msToHhMm(w)}</td>
+                          <td className="num">{msToHhMm(t)}</td>
+                          <td className="num strong">{msToHhMm(tot)}</td>
+                        </tr>
+                      );
+                    })}
+                    {currentProjects.length === 0 && (
+                      <tr>
+                        <td colSpan={4} className="muted small">
+                          Nessun progetto.
+                        </td>
+                      </tr>
+                    )}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
         </section>
 
         <aside className="card">
-          <div className="cardHeader">
-            <div className="cardTitle">Riepilogo</div>
-          </div>
+          <div className="sectionTitle">Gestione</div>
 
-          <div className="kv">
-            <div className="kvRow"><span className="muted">Data</span><span>{selectedDate}</span></div>
-            <div className="kvRow"><span className="muted">Totale</span><span>{minutesToHhMm(totals.totalMinutes)}</span></div>
-          </div>
-
-          <hr className="sep" />
-
-          <div className="sectionTitle">Distribuzione</div>
-          <div className="dist">
-            {state.projects.map((p) => {
-              const m = totals.perProject[p.id] || 0;
-              const pct = totals.totalMinutes > 0 ? (m / totals.totalMinutes) * 100 : 0;
-              return (
-                <div key={p.id} className="distRow">
-                  <div className="distTop">
-                    <span className="truncate">{p.name}</span>
-                    <span className="mono">{minutesToHhMm(m)}</span>
-                  </div>
-                  <div className="bar"><div className="barFill" style={{ width: `${Math.min(100, Math.max(0, pct))}%` }} /></div>
-                </div>
-              );
-            })}
-          </div>
-
-          <hr className="sep" />
-
-          <div className="sectionTitle">Sync iPhone ↔ iMac (Supabase)</div>
-          <div className="muted small">Opzionale. Se non configuri nulla, funziona solo in locale.</div>
-
-          <div className="sync">
-            <input
-              value={sync.supabaseUrl}
-              onChange={(e) => setSync((v) => ({ ...v, supabaseUrl: e.target.value }))}
-              placeholder="Supabase URL (https://xxxx.supabase.co)"
-            />
-            <input
-              value={sync.supabaseAnonKey}
-              onChange={(e) => setSync((v) => ({ ...v, supabaseAnonKey: e.target.value }))}
-              placeholder="Supabase anon key"
-            />
-            <input
-              value={sync.workspaceKey}
-              onChange={(e) => setSync((v) => ({ ...v, workspaceKey: e.target.value }))}
-              placeholder="Workspace key (uguale su tutti i dispositivi)"
-            />
-
-            <div className="syncButtons">
-              <button className="btn" onClick={pullFromCloud} disabled={!isSyncConfigured() || syncStatus.state === "pulling"}>
-                Pull
-              </button>
-              <button className="btn" onClick={pushToCloud} disabled={!isSyncConfigured() || syncStatus.state === "pushing"}>
-                Push
-              </button>
-              <button className={sync.autoPush ? "btn primary" : "btn"} onClick={() => setSync((v) => ({ ...v, autoPush: !v.autoPush }))}>
-                Auto-push: {sync.autoPush ? "ON" : "OFF"}
-              </button>
-              <button className={sync.autoPull ? "btn primary" : "btn"} onClick={() => setSync((v) => ({ ...v, autoPull: !v.autoPull }))}>
-                Auto-pull: {sync.autoPull ? "ON" : "OFF"}
+          <div className="box">
+            <div className="boxTitle">Progetti ({titleUser})</div>
+            <div className="row">
+              <input
+                ref={newProjectRef}
+                className="input"
+                value={newProjectName}
+                onChange={(e) => setNewProjectName(e.target.value)}
+                placeholder="Nuovo progetto…"
+              />
+              <button className="btn" onClick={addProject} disabled={!newProjectName.trim() || scope === "all"}>
+                Aggiungi
               </button>
             </div>
+            <div className="list">
+              {currentProjects.map((p) => (
+                <div key={p.id} className="listRow">
+                  <div className="truncate">{p.name}</div>
+                  <button className="btn ghost" onClick={() => removeProject(p.id)} disabled={scope === "all"}>
+                    Rimuovi
+                  </button>
+                </div>
+              ))}
+              {currentProjects.length === 0 && <div className="muted small">Aggiungi un progetto sopra.</div>}
+            </div>
+          </div>
 
-            <label className="field">
-              <span>Auto-pull (sec)</span>
+          <div className="box">
+            <div className="boxTitle">Collaboratori</div>
+            <div className="row">
               <input
+                className="input"
+                value={newUserName}
+                onChange={(e) => setNewUserName(e.target.value)}
+                placeholder="Nome collaboratore…"
+              />
+              <button className="btn" onClick={addUser} disabled={!newUserName.trim()}>
+                Aggiungi
+              </button>
+            </div>
+            <div className="list">
+              {state.users.map((u) => (
+                <div key={u.id} className="listRow">
+                  <div className="truncate">
+                    {u.name}
+                    {u.id === state.currentUserId ? <span className="badge mini">attivo</span> : null}
+                  </div>
+                  <button className="btn ghost" onClick={() => removeUser(u.id)} disabled={state.users.length <= 1}>
+                    Rimuovi
+                  </button>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          <div className="box">
+            <div className="boxTitle">Riepilogo ({viewRange.label})</div>
+            <div className="kv">
+              <div className="kvRow">
+                <span className="muted">Lavoro</span>
+                <span>{scope === "all" ? msToHhMm(totalsTeam.grandWorkMs) : msToHhMm(totalsMe.totalWorkMs)}</span>
+              </div>
+              <div className="kvRow">
+                <span className="muted">Trasferta</span>
+                <span>{scope === "all" ? msToHhMm(totalsTeam.grandTravelMs) : msToHhMm(totalsMe.totalTravelMs)}</span>
+              </div>
+              <div className="kvRow">
+                <span className="muted">Totale</span>
+                <span className="strong">{scope === "all" ? msToHhMm(totalsTeam.grandTotalMs) : msToHhMm(totalsMe.totalMs)}</span>
+              </div>
+            </div>
+          </div>
+
+          <div className="box">
+            <div className="boxTitle">Sync (Supabase) • opzionale</div>
+            <div className="muted small">
+              Per sincronizzare tra dispositivi (iPhone/iMac/Android). Richiede una tabella <span className="mono">kv</span> su Supabase.
+            </div>
+
+            <label className="field full">
+              <span>Supabase URL</span>
+              <input className="input" value={sync.supabaseUrl} onChange={(e) => setSync((c) => ({ ...c, supabaseUrl: e.target.value }))} placeholder="https://xxxxx.supabase.co" />
+            </label>
+            <label className="field full">
+              <span>Anon key</span>
+              <input className="input" value={sync.supabaseAnonKey} onChange={(e) => setSync((c) => ({ ...c, supabaseAnonKey: e.target.value }))} placeholder="eyJ..." />
+            </label>
+            <label className="field full">
+              <span>Workspace key</span>
+              <input className="input" value={sync.workspaceKey} onChange={(e) => setSync((c) => ({ ...c, workspaceKey: e.target.value }))} placeholder="studio-rossi" />
+            </label>
+
+            <div className="row">
+              <label className="check">
+                <input type="checkbox" checked={sync.autoPush} onChange={(e) => setSync((c) => ({ ...c, autoPush: e.target.checked }))} />
+                <span>Auto push</span>
+              </label>
+              <label className="check">
+                <input type="checkbox" checked={sync.autoPull} onChange={(e) => setSync((c) => ({ ...c, autoPull: e.target.checked }))} />
+                <span>Auto pull</span>
+              </label>
+            </div>
+
+            <label className="field full">
+              <span>Intervallo pull (sec)</span>
+              <input
+                className="input"
                 inputMode="numeric"
                 value={String(sync.autoPullIntervalSec)}
-                onChange={(e) => {
-                  const v = e.target.value.replace(/[^0-9]/g, "");
-                  setSync((s) => ({ ...s, autoPullIntervalSec: v === "" ? 20 : Number(v) }));
-                }}
+                onChange={(e) => setSync((c) => ({ ...c, autoPullIntervalSec: Number(digitsOnly(e.target.value || "20")) || 20 }))}
               />
             </label>
 
-            <div className={syncStatus.state === "error" ? "status error" : "status"}>
-              {syncStatus.message || (isSyncConfigured() ? "Pronto." : "Inserisci i parametri Supabase e una workspaceKey condivisa.")}
+            <div className="row">
+              <button className="btn" onClick={pushToCloud} disabled={!isSyncConfigured()}>
+                Push
+              </button>
+              <button className="btn" onClick={pullFromCloud} disabled={!isSyncConfigured()}>
+                Pull
+              </button>
             </div>
 
+            <div className={syncStatus.state === "error" ? "syncStatus error" : "syncStatus"}>
+              <div className="muted small">
+                Stato: <span className="mono">{syncStatus.state}</span>
+              </div>
+              {syncStatus.message && <div className="small">{syncStatus.message}</div>}
+              <div className="muted tiny">Ultimo push: {formatDateTime(syncStatus.lastPushAt)}</div>
+              <div className="muted tiny">Ultimo pull: {formatDateTime(syncStatus.lastPullAt)}</div>
+            </div>
+
+            <hr className="sep" />
             <div className="muted small">
-              Last push: {formatDateTime(syncStatus.lastPushAt)}
-              <br />
-              Last pull: {formatDateTime(syncStatus.lastPullAt)}
-              <br />
-              UpdatedAt locale: {formatDateTime(state.updatedAt)}
+              PWA: su iPhone apri in Safari → Condividi → Aggiungi a Home. Su Android: menu browser → Installa app.
             </div>
-
-            <div className="muted small">
-              Conflitti: <b>last-write-wins</b> (vince lo stato con <b>updatedAt</b> più recente).
-            </div>
-          </div>
-
-          <hr className="sep" />
-
-          <div className="muted small">
-            PWA: su iPhone apri il link HTTPS in Safari → Condividi → Aggiungi alla schermata Home.
           </div>
         </aside>
       </main>
@@ -708,95 +1745,199 @@ export default function App() {
 }
 
 const styles = `
-  :root { color-scheme: light; }
+  :root {
+    color-scheme: light;
+    --bg: #ffffff;
+    --card: #ffffff;
+    --border: #e5e7eb;
+    --muted: #6b7280;
+    --text: #111827;
+    --accent: #a88a6b; /* beige-marrone come PDF */
+    --accent2: rgba(168, 138, 107, 0.10);
+  }
   * { box-sizing: border-box; }
-  body { margin: 0; font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial; }
+  body { margin: 0; font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial; background: var(--bg); color: var(--text); }
 
   .app { padding: 16px; max-width: 1200px; margin: 0 auto; }
-  .topbar { display: flex; gap: 12px; align-items: flex-end; justify-content: space-between; flex-wrap: wrap; margin-bottom: 12px; }
+
+  .topbar { display: grid; gap: 10px; margin-bottom: 12px; }
+  @media (min-width: 860px) {
+    .topbar { grid-template-columns: 1fr auto; align-items: end; }
+  }
+
   .title { font-size: 22px; font-weight: 700; letter-spacing: -0.01em; }
-  .subtitle { font-size: 12px; color: #6b7280; margin-top: 4px; }
+  .subtitle { font-size: 12px; color: var(--muted); margin-top: 4px; }
 
-  .toolbar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .toolbar { display: flex; gap: 10px; flex-wrap: wrap; align-items: flex-end; justify-content: flex-end; }
 
-  .grid { display: grid; grid-template-columns: 1fr; gap: 12px; }
-  @media (min-width: 980px) { .grid { grid-template-columns: 2fr 1fr; } .span2 { grid-column: 1 / 2; } }
+  .field { display: grid; gap: 4px; font-size: 12px; color: var(--muted); }
+  .field.full { width: 100%; }
+  .field > span { font-weight: 600; }
 
-  .card { border: 1px solid #e5e7eb; border-radius: 14px; padding: 12px; background: #fff; box-shadow: 0 1px 2px rgba(0,0,0,0.04); }
-  .cardHeader { display: flex; justify-content: space-between; gap: 10px; align-items: center; flex-wrap: wrap; margin-bottom: 10px; }
-  .cardTitle { font-weight: 700; }
+  input, select, textarea { font-family: inherit; }
+  select, input[type="date"], .input, .minutes, textarea {
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 10px 12px;
+    background: #fff;
+    color: var(--text);
+    outline: none;
+  }
 
-  input { width: 100%; padding: 10px 10px; border: 1px solid #e5e7eb; border-radius: 10px; outline: none; }
-  input:focus { border-color: #9ca3af; }
+  .input { width: 100%; }
+  textarea { width: 100%; resize: vertical; min-height: 46px; }
 
-  .field { display: grid; gap: 6px; }
-  .field > span { font-size: 12px; color: #6b7280; }
-
-  .btn { padding: 10px 12px; border: 1px solid #e5e7eb; border-radius: 10px; background: #fff; cursor: pointer; }
-  .btn:hover { border-color: #d1d5db; }
+  .btn {
+    border: 1px solid rgba(168, 138, 107, 0.45);
+    background: rgba(168, 138, 107, 0.08);
+    color: var(--text);
+    border-radius: 12px;
+    padding: 10px 12px;
+    cursor: pointer;
+    font-weight: 650;
+    letter-spacing: 0.01em;
+  }
+  .btn:hover { background: rgba(168, 138, 107, 0.12); }
   .btn:disabled { opacity: 0.5; cursor: not-allowed; }
-  .btn.primary { background: #111827; color: #fff; border-color: #111827; }
-  .btn.danger { background: #991b1b; color: #fff; border-color: #991b1b; }
-  .btn.ghost { background: transparent; border-color: transparent; color: #374151; }
+  .btn.danger { border-color: rgba(239, 68, 68, 0.45); background: rgba(239, 68, 68, 0.08); }
 
-  .chip { padding: 8px 10px; border-radius: 999px; border: 1px solid #e5e7eb; background: #fff; cursor: pointer; }
-  .chip:hover { border-color: #d1d5db; }
-  .chip.big { padding: 12px 10px; }
+  .btn.ghost { background: transparent; border-color: var(--border); }
+  .btn.ghost:hover { background: rgba(17, 24, 39, 0.03); }
 
-  .badge { display: inline-block; padding: 6px 10px; border-radius: 999px; background: #f3f4f6; border: 1px solid #e5e7eb; font-size: 12px; }
-  .badge.outline { background: #fff; }
+  .activeStrip { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
 
-  .muted { color: #6b7280; }
+  .badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 10px;
+    border-radius: 999px;
+    border: 1px solid rgba(168, 138, 107, 0.45);
+    background: rgba(168, 138, 107, 0.08);
+    font-size: 12px;
+    font-weight: 650;
+  }
+  .badge.outline { background: transparent; }
+  .badge.mini { margin-left: 8px; padding: 2px 8px; font-size: 11px; }
+
+  .muted { color: var(--muted); }
   .small { font-size: 12px; }
-  .mono { font-variant-numeric: tabular-nums; }
-  .right { text-align: right; }
-  .truncate { display: inline-block; max-width: 70%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; vertical-align: bottom; }
-  .clamp2 { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+  .tiny { font-size: 11px; }
+  .strong { font-weight: 750; }
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; }
 
-  .addRow { display: flex; gap: 8px; align-items: center; width: 100%; max-width: 520px; }
-  .addRow input { flex: 1; }
+  .grid {
+    display: grid;
+    gap: 12px;
+  }
+  @media (min-width: 900px) {
+    .grid { grid-template-columns: 2fr 1fr; }
+  }
 
-  .footerRow { display: flex; justify-content: space-between; gap: 8px; align-items: center; margin-top: 10px; flex-wrap: wrap; }
+  .card {
+    border: 1px solid var(--border);
+    border-radius: 18px;
+    background: var(--card);
+    padding: 14px;
+    box-shadow: 0 6px 18px rgba(17,24,39,0.04);
+  }
 
-  .desktopOnly { display: none; }
-  .mobileOnly { display: block; }
-  @media (min-width: 768px) { .desktopOnly { display: block; } .mobileOnly { display: none; } }
+  .span2 { grid-column: 1 / -1; }
+  @media (min-width: 900px) {
+    .span2 { grid-column: auto; }
+  }
 
-  .tableWrap { overflow: auto; border: 1px solid #e5e7eb; border-radius: 12px; }
-  .table { width: 100%; border-collapse: collapse; min-width: 840px; }
-  .table th, .table td { padding: 10px; border-bottom: 1px solid #f3f4f6; vertical-align: top; }
-  .table th { text-align: left; font-size: 12px; color: #6b7280; background: #fafafa; }
-  .table tr:last-child td { border-bottom: none; }
+  .sectionTitle { font-weight: 800; margin-bottom: 10px; }
 
-  .projName { font-weight: 600; margin-bottom: 6px; }
-  .num { width: 120px; text-align: right; }
-  .num.big { width: 100%; height: 48px; font-size: 16px; text-align: right; }
+  .kv { display: grid; gap: 8px; margin-top: 10px; }
+  .kvRow { display: flex; justify-content: space-between; gap: 10px; }
 
-  .quick { display: flex; gap: 8px; flex-wrap: wrap; }
-  .quickGrid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; }
+  .tableWrap { overflow: auto; border: 1px solid var(--border); border-radius: 14px; margin-top: 10px; }
+  .table { width: 100%; border-collapse: collapse; }
+  .table th, .table td { padding: 10px 12px; border-bottom: 1px solid var(--border); font-size: 13px; }
+  .table th { text-align: left; font-size: 12px; color: var(--muted); background: rgba(17,24,39,0.02); }
+  .table td.num, .table th.num { text-align: right; white-space: nowrap; }
 
-  .cards { display: grid; gap: 10px; }
-  .rowCard { border: 1px solid #e5e7eb; border-radius: 14px; padding: 12px; }
-  .rowTop { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
-  .rowMid { display: flex; justify-content: space-between; align-items: center; gap: 8px; margin-top: 10px; }
-  .rowInputs { display: grid; gap: 8px; margin-top: 10px; }
+  .truncate { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
-  .sep { border: none; border-top: 1px solid #e5e7eb; margin: 12px 0; }
-  .sectionTitle { font-weight: 700; margin-bottom: 8px; }
+  .box { border: 1px solid var(--border); border-radius: 16px; padding: 12px; display: grid; gap: 10px; margin-top: 10px; }
+  .boxTitle { font-weight: 800; }
+  .row { display: flex; gap: 10px; align-items: center; }
+  .row > * { flex: 1; }
+  .row > button { flex: 0 0 auto; }
 
-  .kv { display: grid; gap: 8px; }
-  .kvRow { display: flex; justify-content: space-between; gap: 8px; }
+  .list { display: grid; gap: 8px; }
+  .listRow { display: flex; gap: 10px; justify-content: space-between; align-items: center; }
 
-  .dist { display: grid; gap: 10px; }
-  .distRow { display: grid; gap: 6px; }
-  .distTop { display: flex; justify-content: space-between; gap: 10px; }
-  .bar { height: 8px; background: #f3f4f6; border-radius: 999px; overflow: hidden; }
-  .barFill { height: 8px; background: #111827; }
+  .check { display: inline-flex; gap: 8px; align-items: center; font-size: 12px; color: var(--text); }
 
-  .sync { display: grid; gap: 8px; }
-  .syncButtons { display: flex; gap: 8px; flex-wrap: wrap; }
-  .status { font-size: 12px; color: #6b7280; }
-  .status.error { color: #991b1b; }
+  .sep { border: none; border-top: 1px solid var(--border); margin: 10px 0; }
+
+  .syncStatus { border: 1px solid var(--border); border-radius: 14px; padding: 10px; display: grid; gap: 4px; }
+  .syncStatus.error { border-color: rgba(239,68,68,0.45); background: rgba(239,68,68,0.05); }
+
+  /* PDF-like layout */
+  .pdfWrap { display: grid; gap: 12px; }
+  .pdfHead { display: flex; justify-content: space-between; align-items: flex-end; gap: 12px; flex-wrap: wrap; }
+  .pdfTitle { font-size: 20px; font-weight: 900; letter-spacing: -0.02em; }
+  .pdfDate { color: var(--muted); font-size: 12px; margin-top: 2px; }
+  .pdfTotals { display: grid; gap: 6px; min-width: 220px; }
+  .pdfTotalRow { display: flex; justify-content: space-between; gap: 10px; font-size: 13px; }
+
+  .pdfList { display: grid; gap: 12px; }
+  .pdfList.compact .pdfEdit { display: none; }
+
+  .pdfRow { border: 1px solid var(--border); border-radius: 18px; padding: 12px; display: grid; gap: 10px; }
+  .pdfRow.active { border-color: rgba(168, 138, 107, 0.65); box-shadow: 0 10px 24px rgba(168,138,107,0.12); }
+
+  .pdfLeft { display: grid; gap: 6px; }
+  .pdfProjName { font-size: 16px; font-weight: 900; }
+  .pdfMeta { display: flex; gap: 8px; flex-wrap: wrap; }
+
+  .pill { font-size: 12px; padding: 4px 10px; border-radius: 999px; border: 1px solid var(--border); background: rgba(17,24,39,0.02); }
+
+  .pdfBtns { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  .bigBtn {
+    border: 1px solid rgba(168, 138, 107, 0.45);
+    background: rgba(168, 138, 107, 0.06);
+    border-radius: 18px;
+    padding: 12px;
+    cursor: pointer;
+    display: grid;
+    justify-items: center;
+    gap: 8px;
+  }
+  .bigBtn:hover { background: rgba(168, 138, 107, 0.10); }
+  .bigBtn.on { background: rgba(168, 138, 107, 0.14); border-color: rgba(168, 138, 107, 0.75); }
+  .bigLabel { font-weight: 900; letter-spacing: 0.02em; }
+
+  .pdfEdit { display: grid; gap: 10px; grid-template-columns: 1fr 1fr; }
+  .editBlock { display: grid; gap: 6px; }
+  .editBlock.wide { grid-column: 1 / -1; }
+  .editLabel { font-size: 12px; color: var(--muted); font-weight: 700; }
+  .editRow { display: flex; gap: 8px; align-items: center; }
+
+  .mini {
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 9px 10px;
+    background: #fff;
+    cursor: pointer;
+    font-weight: 800;
+  }
+  .mini:disabled { opacity: 0.5; cursor: not-allowed; }
+  .minutes { width: 100%; text-align: center; font-weight: 800; }
+
+  .detailWrap { display: grid; gap: 10px; }
+
+  /* Mobile tweaks */
+  @media (max-width: 520px) {
+    .toolbar { justify-content: flex-start; }
+    .pdfBtns { grid-template-columns: 1fr; }
+    .pdfEdit { grid-template-columns: 1fr; }
+    .row { flex-direction: column; align-items: stretch; }
+    .row > button { width: 100%; }
+  }
 `;
 
 // ----------------------
@@ -811,11 +1952,33 @@ const styles = `
 
   try {
     console.assert(pad2(1) === "01", "pad2 failed");
-    console.assert(minutesToHhMm(0) === "0h 00m", "minutesToHhMm(0) failed");
-    console.assert(minutesToHhMm(61) === "1h 01m", "minutesToHhMm(61) failed");
-    console.assert(csvEscape("a\nb") === '"a\nb"', "csvEscape LF failed");
+
+    console.assert(msToHhMm(0) === "0h 00m", "msToHhMm(0) failed");
+    console.assert(msToHhMm(61 * 60000) === "1h 01m", "msToHhMm(61m) failed");
+
+    // CSV escaping tests (regression for unterminated regex/string bugs)
+    console.assert(csvEscape("plain") === "plain", "csvEscape plain failed");
+    console.assert(csvEscape('a"b') === '"a""b"', "csvEscape quote failed");
+    console.assert(csvEscape("a,b") === '"a,b"', "csvEscape comma failed");
+    console.assert(csvEscape("a\nb") === '"a\nb"', "csvEscape newline failed");
+    console.assert(csvEscape("a\rb") === '"a\rb"', "csvEscape CR failed");
+
+    console.assert(digitsOnly("a1b2") === "12", "digitsOnly failed");
+    console.assert(trimTrailingSlash("https://x/") === "https://x", "trimTrailingSlash failed");
+
+    const b = getRuntimeBaseUrl();
+    console.assert(typeof b === "string" && b.startsWith("/") && b.endsWith("/"), "getRuntimeBaseUrl failed");
+    console.assert(normalizeBaseUrl("tracker-ore") === "/tracker-ore/", "normalizeBaseUrl no slash failed");
+
     const id = cryptoRandomId();
     console.assert(typeof id === "string" && id.length > 5, "cryptoRandomId failed");
+
+    console.assert(startOfMonthISO("2026-02-19") === "2026-02-01", "startOfMonthISO failed");
+    console.assert(startOfYearISO("2026-02-19") === "2026-01-01", "startOfYearISO failed");
+    console.assert(endOfYearISO("2026-02-19") === "2026-12-31", "endOfYearISO failed");
+
+    const r = rangeDatesISO("2026-02-01", "2026-02-03");
+    console.assert(r.length === 3 && r[0] === "2026-02-01" && r[2] === "2026-02-03", "rangeDatesISO failed");
   } catch {
     // ignore
   }
