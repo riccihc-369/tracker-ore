@@ -4,23 +4,20 @@ import { useEffect, useMemo, useRef, useState } from "react";
  * Tracker ore per progetti (Vite + React)
  *
  * Modalità cronometro (per collaboratore):
- * - Premi un progetto => avvia il timer di quel progetto (modalità Lavoro)
- * - Premi TRASFERTA => avvia il timer del progetto in modalità Trasferta
+ * - Premi un progetto => avvia il timer di quel progetto (Lavoro)
  * - Premi un altro progetto => ferma e salva il precedente, poi avvia il nuovo
  * - Premi STOP => ferma e salva il progetto attivo
  *
- * Feature richieste:
- * 1) 🔒 Blocco modifica minuti mentre il timer è attivo (sul progetto attivo)
- * 2) 📊 Vista Giorno / Settimana / Mese / Anno + Team: Somma o Confronto
- * 3) 👥 Multi-utente (separazione per collaboratore dentro la stessa workspace)
- * 4) ✈️ TRASFERTA per progetto (conteggio separato e visibile nei riepiloghi + export)
+ * Trasferta (NUOVO):
+ * - NON c'è più timer trasferta
+ * - "Trasferta" è un memo/flag per progetto (toggle) visibile nei resoconti + export
  *
  * Persistenza + Sync:
  * - localStorage
  * - Sync multi-dispositivo opzionale via Supabase REST (tabella kv), last-write-wins (per-workspace)
  */
 
-const LS_KEY = "ore_progetti_vite_multi_v4";
+const LS_KEY = "ore_progetti_vite_multi_v5_no_travel_timer";
 const SYNC_KEY = "ore_progetti_sync_vite_simple_v2";
 
 function pad2(n: number) {
@@ -97,9 +94,6 @@ function safeJsonParse<T>(s: string | null, fallback: T): T {
 
 function csvEscape(value: unknown) {
   const s = String(value ?? "");
-  // Escape if it contains a double quote, comma, CR or LF.
-  // IMPORTANT: keep this regex on ONE LINE (no literal newlines), otherwise you'll get:
-  // SyntaxError: Unterminated regular expression
   if (/["\n\r,]/.test(s)) return `"${s.replaceAll('"', '""')}"`;
   return s;
 }
@@ -157,7 +151,6 @@ function normalizeBaseUrl(base: string) {
 }
 
 function getRuntimeBaseUrl() {
-  // Evita crash se import.meta.env non esiste (alcuni sandbox / build non-Vite)
   const viteBase = (import.meta as any)?.env?.BASE_URL as string | undefined;
   if (viteBase) return normalizeBaseUrl(viteBase);
 
@@ -172,13 +165,12 @@ function getRuntimeBaseUrl() {
 
 type Project = { id: string; name: string };
 
-type Entry = { workMs: number; travelMs: number; note: string };
+// ✅ Entry senza travelMs: trasferta è un flag/memo
+type Entry = { workMs: number; note: string; travel: boolean };
 
 type Day = { entries: Record<string, Entry> };
 
-type TimerMode = "work" | "travel";
-
-type ActiveTimer = { projectId: string | null; startedAt: number | null; mode: TimerMode };
+type ActiveTimer = { projectId: string | null; startedAt: number | null };
 
 type User = { id: string; name: string };
 
@@ -209,11 +201,8 @@ type SyncStatus = {
 };
 
 type ViewMode = "day" | "week" | "month" | "year";
-
 type ScopeMode = "me" | "all";
-
 type TeamMode = "sum" | "compare";
-
 type LayoutMode = "pdf" | "dettagli";
 
 const defaultState = (): AppState => {
@@ -233,7 +222,7 @@ const defaultState = (): AppState => {
     perUser: {
       [me.id]: {
         days: {},
-        active: { projectId: null, startedAt: null, mode: "work" as TimerMode },
+        active: { projectId: null, startedAt: null },
       },
     },
   };
@@ -255,8 +244,7 @@ function ensureUserState(s: AppState, userId: string): AppState {
     ...s,
     perUser: {
       ...perUser,
-      [userId]:
-        perUser[userId] || ({ days: {}, active: { projectId: null, startedAt: null, mode: "work" as TimerMode } } as UserState),
+      [userId]: perUser[userId] || ({ days: {}, active: { projectId: null, startedAt: null } } as UserState),
     },
     projectsByUser: {
       ...projectsByUser,
@@ -266,6 +254,7 @@ function ensureUserState(s: AppState, userId: string): AppState {
 }
 
 function migrateState(raw: any): AppState {
+  // v5 (this file)
   if (raw && typeof raw === "object" && Array.isArray(raw.users) && raw.perUser && raw.projectsByUser) {
     const s: AppState = {
       updatedAt: Number(raw.updatedAt || Date.now()),
@@ -290,8 +279,7 @@ function migrateState(raw: any): AppState {
         .map((p) => ({ id: String((p as any).id || cryptoRandomId()), name: String((p as any).name || "") }))
         .filter((p) => p.name.trim().length > 0);
 
-      const us =
-        s.perUser[u.id] || ({ days: {}, active: { projectId: null, startedAt: null, mode: "work" as TimerMode } } as UserState);
+      const us = s.perUser[u.id] || ({ days: {}, active: { projectId: null, startedAt: null } } as UserState);
       const days = us.days && typeof us.days === "object" ? us.days : {};
       const nextDays: Record<string, Day> = {};
 
@@ -301,22 +289,24 @@ function migrateState(raw: any): AppState {
         for (const [pid, entry] of Object.entries(e)) {
           const ent: any = entry || {};
 
-          // Support legacy fields:
-          // - ms (single bucket)
-          // - workMs / travelMs
-          // - minutes (single bucket)
-          const workMs =
+          // ✅ MIGRAZIONE: supporta legacy:
+          // - v4: workMs / travelMs / note
+          // - v1: ms / minutes
+          // Strategia: lavoro = workMs + travelMs (così non perdi ore), travel flag se travelMs > 0 o ent.travel true
+          const legacyWorkMs =
             typeof ent.workMs === "number"
               ? ent.workMs
               : typeof ent.ms === "number"
                 ? ent.ms
                 : minutesIntToMs(ent.minutes || 0);
-          const travelMs = typeof ent.travelMs === "number" ? ent.travelMs : 0;
+
+          const legacyTravelMs = typeof ent.travelMs === "number" ? ent.travelMs : 0;
+          const legacyTravelFlag = Boolean(ent.travel) || legacyTravelMs > 0;
 
           entries[String(pid)] = {
-            workMs: clampNonNeg(workMs),
-            travelMs: clampNonNeg(travelMs),
+            workMs: clampNonNeg(legacyWorkMs + legacyTravelMs),
             note: String(ent.note || ""),
+            travel: legacyTravelFlag,
           };
         }
         nextDays[String(date)] = { entries };
@@ -325,13 +315,12 @@ function migrateState(raw: any): AppState {
       let active: ActiveTimer = {
         projectId: us.active?.projectId ?? null,
         startedAt: us.active?.startedAt ?? null,
-        mode: (us.active?.mode as TimerMode) || "work",
       };
 
       if (active.projectId && !nextProjectsByUser[u.id].some((p) => p.id === active.projectId)) {
-        active = { projectId: null, startedAt: null, mode: "work" as TimerMode };
+        active = { projectId: null, startedAt: null };
       }
-      if (active.projectId && !active.startedAt) active = { projectId: null, startedAt: null, mode: "work" as TimerMode };
+      if (active.projectId && !active.startedAt) active = { projectId: null, startedAt: null };
 
       nextPerUser[u.id] = { days: nextDays, active };
     }
@@ -450,25 +439,28 @@ export default function App() {
 
   // PWA: registra Service Worker (robusto per GitHub Pages / base path)
   useEffect(() => {
-    const base = getRuntimeBaseUrl();
+  const base = getRuntimeBaseUrl();
 
-    try {
-      const manifestLink = document.querySelector<HTMLLinkElement>('link[rel="manifest"]');
-      if (manifestLink) {
-        const wanted = `${base}manifest.webmanifest`;
-        if (manifestLink.getAttribute("href") !== wanted) manifestLink.setAttribute("href", wanted);
+  try {
+    const manifestLink = document.querySelector<HTMLLinkElement>('link[rel="manifest"]');
+    if (manifestLink) {
+      const wanted = `${base}manifest.webmanifest`;
+      if (manifestLink.getAttribute("href") !== wanted) {
+        manifestLink.setAttribute("href", wanted);
       }
-    } catch {
-      // ignore
     }
+  } catch {
+    // ignore
+  }
 
-    if (!("serviceWorker" in navigator)) return;
+  if (!("serviceWorker" in navigator)) return;
 
-    const swUrl = `${base}sw.js`;
-    navigator.serviceWorker.register(swUrl).catch(() => {
-      /* ignore */
-    });
-  }, []);
+  navigator.serviceWorker.getRegistrations().then((regs) => {
+    regs.forEach((reg) => reg.unregister());
+  }).catch(() => {
+    // ignore
+  });
+}, []);
 
   function setStateStamped(updater: (prev: AppState) => AppState) {
     setState((prev) => ({ ...updater(prev), updatedAt: Date.now() }));
@@ -485,7 +477,7 @@ export default function App() {
   );
 
   const activeForCurrentUser = useMemo<ActiveTimer>(
-    () => state.perUser?.[currentUser.id]?.active || { projectId: null, startedAt: null, mode: "work" as TimerMode},
+    () => state.perUser?.[currentUser.id]?.active || { projectId: null, startedAt: null },
     [state.perUser, currentUser.id],
   );
 
@@ -524,23 +516,20 @@ export default function App() {
   function getEntry(userId: string, dateISO: string, projectId: string): Entry {
     const us = state.perUser?.[userId];
     const day = us?.days?.[dateISO];
-    return day?.entries?.[projectId] || { workMs: 0, travelMs: 0, note: "" };
+    return day?.entries?.[projectId] || { workMs: 0, note: "", travel: false };
   }
 
-  function getDisplayBuckets(userId: string, dateISO: string, projectId: string) {
+  function getDisplayWork(userId: string, dateISO: string, projectId: string) {
     const entry = getEntry(userId, dateISO, projectId);
     const active = state.perUser?.[userId]?.active;
 
     let workMs = clampNonNeg(entry.workMs);
-    let travelMs = clampNonNeg(entry.travelMs);
 
     if (active?.projectId === projectId && active.startedAt) {
-      const add = elapsedMs(active.startedAt, nowTick);
-      if (active.mode === "travel") travelMs = clampNonNeg(travelMs + add);
-      else workMs = clampNonNeg(workMs + add);
+      workMs = clampNonNeg(workMs + elapsedMs(active.startedAt, nowTick));
     }
 
-    return { workMs, travelMs, totalMs: clampNonNeg(workMs + travelMs) };
+    return { workMs };
   }
 
   function getDateRangeForView(): { startISO: string; endISO: string; label: string } {
@@ -576,23 +565,28 @@ export default function App() {
   const totalsMe = useMemo(() => {
     const dates = rangeDatesISO(viewRange.startISO, viewRange.endISO);
     let totalWorkMs = 0;
-    let totalTravelMs = 0;
-    const perProject: Record<string, { workMs: number; travelMs: number; totalMs: number }> = {};
+
+    const perProject: Record<string, { workMs: number }> = {};
+    const perProjectTravelFlag: Record<string, boolean> = {};
 
     for (const p of currentProjects) {
       let w = 0;
-      let t = 0;
+      let anyTravel = false;
+
       for (const d of dates) {
-        const b = getDisplayBuckets(currentUser.id, d, p.id);
+        const b = getDisplayWork(currentUser.id, d, p.id);
         w += b.workMs;
-        t += b.travelMs;
+
+        const e = getEntry(currentUser.id, d, p.id);
+        if (e.travel) anyTravel = true;
       }
-      perProject[p.id] = { workMs: w, travelMs: t, totalMs: w + t };
+
+      perProject[p.id] = { workMs: w };
+      perProjectTravelFlag[p.id] = anyTravel;
       totalWorkMs += w;
-      totalTravelMs += t;
     }
 
-    return { totalWorkMs, totalTravelMs, totalMs: totalWorkMs + totalTravelMs, perProject, dates };
+    return { totalWorkMs, perProject, perProjectTravelFlag, dates };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [currentProjects, state.perUser, currentUser.id, viewRange.startISO, viewRange.endISO, nowTick]);
 
@@ -600,9 +594,8 @@ export default function App() {
     const dates = rangeDatesISO(viewRange.startISO, viewRange.endISO);
     const userIds = state.users.map((u) => u.id);
 
-    const matrix: Record<string, Record<string, { workMs: number; travelMs: number; totalMs: number }>> = {};
+    const matrix: Record<string, Record<string, { workMs: number; anyTravel: boolean }>> = {};
     let grandWorkMs = 0;
-    let grandTravelMs = 0;
 
     for (const pname of projectNameUniverse) {
       matrix[pname] = {};
@@ -611,33 +604,33 @@ export default function App() {
         const proj = ps.find((p) => p.name === pname);
 
         let w = 0;
-        let t = 0;
+        let anyTravel = false;
+
         if (proj) {
           for (const d of dates) {
-            const b = getDisplayBuckets(uid, d, proj.id);
+            const b = getDisplayWork(uid, d, proj.id);
             w += b.workMs;
-            t += b.travelMs;
+
+            const e = getEntry(uid, d, proj.id);
+            if (e.travel) anyTravel = true;
           }
         }
 
-        matrix[pname][uid] = { workMs: w, travelMs: t, totalMs: w + t };
+        matrix[pname][uid] = { workMs: w, anyTravel };
         grandWorkMs += w;
-        grandTravelMs += t;
       }
     }
 
-    const perUserTotal: Record<string, { workMs: number; travelMs: number; totalMs: number }> = {};
+    const perUserTotal: Record<string, { workMs: number }> = {};
     for (const uid of userIds) {
       let w = 0;
-      let t = 0;
       for (const pname of projectNameUniverse) {
         w += matrix[pname][uid]?.workMs || 0;
-        t += matrix[pname][uid]?.travelMs || 0;
       }
-      perUserTotal[uid] = { workMs: w, travelMs: t, totalMs: w + t };
+      perUserTotal[uid] = { workMs: w };
     }
 
-    return { dates, matrix, grandWorkMs, grandTravelMs, grandTotalMs: grandWorkMs + grandTravelMs, perUserTotal };
+    return { dates, matrix, grandWorkMs, perUserTotal };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [state.users, state.projectsByUser, state.perUser, projectNameUniverse, viewRange.startISO, viewRange.endISO, nowTick]);
 
@@ -646,12 +639,12 @@ export default function App() {
       const s = ensureUserState(s0, userId);
       const us = s.perUser[userId];
       const prevDay = us.days?.[dateISO] || { entries: {} };
-      const prevEntry: Entry = (prevDay.entries?.[projectId] as Entry) || { workMs: 0, travelMs: 0, note: "" };
+      const prevEntry: Entry = (prevDay.entries?.[projectId] as Entry) || { workMs: 0, note: "", travel: false };
 
       const nextEntry: Entry = {
         workMs: patch.workMs !== undefined ? clampNonNeg(patch.workMs) : clampNonNeg(prevEntry.workMs),
-        travelMs: patch.travelMs !== undefined ? clampNonNeg(patch.travelMs) : clampNonNeg(prevEntry.travelMs),
         note: patch.note !== undefined ? String(patch.note) : String(prevEntry.note || ""),
+        travel: patch.travel !== undefined ? Boolean(patch.travel) : Boolean(prevEntry.travel),
       };
 
       return {
@@ -676,27 +669,24 @@ export default function App() {
     });
   }
 
-  function bumpMs(userId: string, dateISO: string, projectId: string, deltaMs: number, bucket: TimerMode) {
+  function bumpMs(userId: string, dateISO: string, projectId: string, deltaMs: number) {
     setStateStamped((s0) => {
       let s = ensureUserState(s0, userId);
       const us = s.perUser[userId];
       const prevDay = us.days?.[dateISO] || { entries: {} };
-      const prevEntry: Entry = (prevDay.entries?.[projectId] as Entry) || { workMs: 0, travelMs: 0, note: "" };
+      const prevEntry: Entry = (prevDay.entries?.[projectId] as Entry) || { workMs: 0, note: "", travel: false };
 
       let nextWorkMs = clampNonNeg(prevEntry.workMs);
-      let nextTravelMs = clampNonNeg(prevEntry.travelMs);
 
-      // Se sto modificando il progetto attivo, materializzo l'elapsed prima (per coerenza)
+      // Se sto modificando il progetto attivo, materializzo l'elapsed prima (coerenza)
       let active = us.active;
       if (active.projectId === projectId && active.startedAt) {
         const add = elapsedMs(active.startedAt, Date.now());
-        if (active.mode === "travel") nextTravelMs = clampNonNeg(nextTravelMs + add);
-        else nextWorkMs = clampNonNeg(nextWorkMs + add);
-        active = { projectId, startedAt: Date.now(), mode: active.mode };
+        nextWorkMs = clampNonNeg(nextWorkMs + add);
+        active = { projectId, startedAt: Date.now() };
       }
 
-      if (bucket === "travel") nextTravelMs = clampNonNeg(nextTravelMs + deltaMs);
-      else nextWorkMs = clampNonNeg(nextWorkMs + deltaMs);
+      nextWorkMs = clampNonNeg(nextWorkMs + deltaMs);
 
       return {
         ...s,
@@ -711,7 +701,7 @@ export default function App() {
                 ...prevDay,
                 entries: {
                   ...prevDay.entries,
-                  [projectId]: { ...prevEntry, workMs: nextWorkMs, travelMs: nextTravelMs },
+                  [projectId]: { ...prevEntry, workMs: nextWorkMs },
                 },
               },
             },
@@ -719,6 +709,11 @@ export default function App() {
         },
       };
     });
+  }
+
+  function toggleTrasfertaMemo(userId: string, dateISO: string, projectId: string) {
+    const cur = getEntry(userId, dateISO, projectId);
+    updateEntry(userId, dateISO, projectId, { travel: !cur.travel });
   }
 
   function addProject() {
@@ -758,8 +753,7 @@ export default function App() {
         }
       }
 
-      const nextActive =
-        us.active?.projectId === projectId ? { projectId: null, startedAt: null, mode: "work" as TimerMode } : us.active;
+      const nextActive = us.active?.projectId === projectId ? { projectId: null, startedAt: null } : us.active;
 
       return {
         ...s,
@@ -781,7 +775,7 @@ export default function App() {
       const nextEntries: Record<string, Entry> = { ...prevDay.entries };
 
       for (const p of s.projectsByUser[uid] || []) {
-        if (nextEntries[p.id]) nextEntries[p.id] = { ...nextEntries[p.id], workMs: 0, travelMs: 0 };
+        if (nextEntries[p.id]) nextEntries[p.id] = { ...nextEntries[p.id], workMs: 0 };
       }
 
       return {
@@ -804,15 +798,13 @@ export default function App() {
     const us = s.perUser?.[userId];
     if (!us) return s;
 
-    const { projectId, startedAt, mode } = us.active;
+    const { projectId, startedAt } = us.active;
     if (!projectId || !startedAt) return s;
 
     const prevDay = us.days?.[dateISO] || { entries: {} };
-    const prevEntry: Entry = (prevDay.entries?.[projectId] as Entry) || { workMs: 0, travelMs: 0, note: "" };
+    const prevEntry: Entry = (prevDay.entries?.[projectId] as Entry) || { workMs: 0, note: "", travel: false };
 
-    const nextWorkMs = mode === "work" ? applyElapsed(prevEntry.workMs, startedAt, now) : clampNonNeg(prevEntry.workMs);
-    const nextTravelMs =
-      mode === "travel" ? applyElapsed(prevEntry.travelMs, startedAt, now) : clampNonNeg(prevEntry.travelMs);
+    const nextWorkMs = applyElapsed(prevEntry.workMs, startedAt, now);
 
     return {
       ...s,
@@ -820,14 +812,14 @@ export default function App() {
         ...s.perUser,
         [userId]: {
           ...us,
-          active: { projectId: null, startedAt: null, mode: "work" as TimerMode},
+          active: { projectId: null, startedAt: null },
           days: {
             ...us.days,
             [dateISO]: {
               ...prevDay,
               entries: {
                 ...prevDay.entries,
-                [projectId]: { ...prevEntry, workMs: nextWorkMs, travelMs: nextTravelMs },
+                [projectId]: { ...prevEntry, workMs: nextWorkMs },
               },
             },
           },
@@ -836,14 +828,14 @@ export default function App() {
     };
   }
 
-  function startProject(projectId: string, mode: TimerMode) {
+  function startProject(projectId: string) {
     const now = Date.now();
     setStateStamped((s0) => {
       let s = ensureUserState(s0, currentUser.id);
       const uid = currentUser.id;
       const us = s.perUser[uid];
 
-      if (us.active.projectId === projectId && us.active.startedAt && us.active.mode === mode) return s;
+      if (us.active.projectId === projectId && us.active.startedAt) return s;
 
       // stop previous (if any) on selectedDate
       s = materializeActiveIfNeeded(s, uid, selectedDate, now);
@@ -856,7 +848,7 @@ export default function App() {
           ...s.perUser,
           [uid]: {
             ...nextUs,
-            active: { projectId, startedAt: now, mode },
+            active: { projectId, startedAt: now },
           },
         },
       };
@@ -869,18 +861,7 @@ export default function App() {
   }
 
   function exportCsv() {
-    // CSV è perfetto per Excel (Importa da file). Se vuoi, in futuro possiamo generare XLSX nativo.
-    const header = [
-      "Range",
-      "Data",
-      "Collaboratore",
-      "Progetto",
-      "Minuti lavoro",
-      "Minuti trasferta",
-      "Minuti totali",
-      "Ore totali",
-      "Note",
-    ];
+    const header = ["Range", "Data", "Collaboratore", "Progetto", "Minuti lavoro", "Ore totali", "Trasferta (memo)", "Note"];
     const rows: string[][] = [header];
 
     const dates = rangeDatesISO(viewRange.startISO, viewRange.endISO);
@@ -890,22 +871,11 @@ export default function App() {
       for (const dateISO of dates) {
         for (const p of ps) {
           const entry = getEntry(u.id, dateISO, p.id);
-          const b = getDisplayBuckets(u.id, dateISO, p.id);
+          const b = getDisplayWork(u.id, dateISO, p.id);
           const mWork = msToMinutesInt(b.workMs);
-          const mTravel = msToMinutesInt(b.travelMs);
-          const mTot = mWork + mTravel;
-          const ore = (mTot / 60).toFixed(2);
-          rows.push([
-            viewRange.label,
-            dateISO,
-            u.name,
-            p.name,
-            String(mWork),
-            String(mTravel),
-            String(mTot),
-            ore,
-            entry.note || "",
-          ]);
+          const ore = (mWork / 60).toFixed(2);
+
+          rows.push([viewRange.label, dateISO, u.name, p.name, String(mWork), ore, entry.travel ? "SI" : "NO", entry.note || ""]);
         }
       }
     }
@@ -941,7 +911,7 @@ export default function App() {
         },
         perUser: {
           ...s.perUser,
-          [id]: s.perUser[id] || { days: {}, active: { projectId: null, startedAt: null, mode: "work" as TimerMode} },
+          [id]: s.perUser[id] || { days: {}, active: { projectId: null, startedAt: null } },
         },
       };
     });
@@ -1128,21 +1098,20 @@ export default function App() {
   const isAnyTimerRunningForCurrentUser = Boolean(activeForCurrentUser.projectId && activeForCurrentUser.startedAt);
 
   function exportTeamCompareCsv() {
-    const header = ["Range", "Progetto", ...state.users.map((u) => `${u.name} (tot)`), "Totale", "Trasferta (team)"];
+    const header = ["Range", "Progetto", ...state.users.map((u) => `${u.name} (ore)`), "Totale ore"];
     const rows: string[][] = [header];
 
     for (const pname of projectNameUniverse) {
       const row: string[] = [viewRange.label, pname];
       let sum = 0;
-      let sumTravel = 0;
+
       for (const u of state.users) {
-        const b = totalsTeam.matrix[pname]?.[u.id] || { workMs: 0, travelMs: 0, totalMs: 0 };
-        sum += b.totalMs;
-        sumTravel += b.travelMs;
-        row.push(msToHhMm(b.totalMs));
+        const ms = totalsTeam.matrix[pname]?.[u.id]?.workMs || 0;
+        sum += ms;
+        row.push(msToHhMm(ms));
       }
+
       row.push(msToHhMm(sum));
-      row.push(msToHhMm(sumTravel));
       rows.push(row);
     }
 
@@ -1167,7 +1136,7 @@ export default function App() {
       <header className="topbar">
         <div>
           <div className="title">Tracker ore per progetti</div>
-          <div className="subtitle">Cronometro per progetto • local + sync Supabase (opzionale) • last-write-wins</div>
+          <div className="subtitle">Cronometro per progetto • local + sync Supabase (opzionale) • last-write-wins • trasferta = memo</div>
         </div>
 
         <div className="toolbar">
@@ -1221,11 +1190,7 @@ export default function App() {
             </label>
           )}
 
-          <button
-            className={isAnyTimerRunningForCurrentUser ? "btn danger" : "btn"}
-            onClick={stopActive}
-            disabled={!isAnyTimerRunningForCurrentUser || scope === "all"}
-          >
+          <button className={isAnyTimerRunningForCurrentUser ? "btn danger" : "btn"} onClick={stopActive} disabled={!isAnyTimerRunningForCurrentUser || scope === "all"}>
             STOP
           </button>
 
@@ -1251,10 +1216,7 @@ export default function App() {
         <div className="activeStrip">
           <div className="userPill">
             <span className="muted small">Collaboratore</span>
-            <select
-              value={state.currentUserId}
-              onChange={(e) => setStateStamped((s) => ({ ...s, currentUserId: e.target.value }))}
-            >
+            <select value={state.currentUserId} onChange={(e) => setStateStamped((s) => ({ ...s, currentUserId: e.target.value }))}>
               {state.users.map((u) => (
                 <option key={u.id} value={u.id}>
                   {u.name}
@@ -1265,9 +1227,7 @@ export default function App() {
 
           {isAnyTimerRunningForCurrentUser && scope === "me" && (
             <>
-              <span className="badge">
-                Attivo: {activeProjectName || "(sconosciuto)"} • {activeForCurrentUser.mode === "travel" ? "TRASFERTA" : "LAVORO"}
-              </span>
+              <span className="badge">Attivo: {activeProjectName || "(sconosciuto)"} • LAVORO</span>
               <span className="muted small">Avviato: {formatDateTime(activeForCurrentUser.startedAt)}</span>
             </>
           )}
@@ -1275,9 +1235,7 @@ export default function App() {
           {scope === "all" && (
             <>
               <span className="badge outline">{viewRange.label}</span>
-              <span className="muted small">
-                Totale team: {msToHhMm(totalsTeam.grandTotalMs)} • Trasferta: {msToHhMm(totalsTeam.grandTravelMs)}
-              </span>
+              <span className="muted small">Totale team: {msToHhMm(totalsTeam.grandWorkMs)}</span>
             </>
           )}
         </div>
@@ -1296,14 +1254,6 @@ export default function App() {
                       <span className="muted">Totale lavoro</span>
                       <span>{msToHhMm(totalsTeam.grandWorkMs)}</span>
                     </div>
-                    <div className="kvRow">
-                      <span className="muted">Totale trasferta</span>
-                      <span>{msToHhMm(totalsTeam.grandTravelMs)}</span>
-                    </div>
-                    <div className="kvRow">
-                      <span className="muted">Totale complessivo</span>
-                      <span>{msToHhMm(totalsTeam.grandTotalMs)}</span>
-                    </div>
                   </div>
 
                   <div className="tableWrap">
@@ -1311,37 +1261,28 @@ export default function App() {
                       <thead>
                         <tr>
                           <th>Progetto</th>
-                          <th className="num">Lavoro</th>
-                          <th className="num">Trasferta</th>
                           <th className="num">Totale</th>
                         </tr>
                       </thead>
                       <tbody>
                         {projectNameUniverse.map((pname) => {
                           let w = 0;
-                          let t = 0;
-                          for (const u of state.users) {
-                            w += totalsTeam.matrix[pname]?.[u.id]?.workMs || 0;
-                            t += totalsTeam.matrix[pname]?.[u.id]?.travelMs || 0;
-                          }
-                          const tot = w + t;
-                          if (!tot) return null;
+                          for (const u of state.users) w += totalsTeam.matrix[pname]?.[u.id]?.workMs || 0;
+                          if (!w) return null;
                           return (
                             <tr key={pname}>
                               <td className="truncate">{pname}</td>
-                              <td className="num">{msToHhMm(w)}</td>
-                              <td className="num">{msToHhMm(t)}</td>
-                              <td className="num strong">{msToHhMm(tot)}</td>
+                              <td className="num strong">{msToHhMm(w)}</td>
                             </tr>
                           );
                         })}
                         {projectNameUniverse.every((pname) => {
                           let sum = 0;
-                          for (const u of state.users) sum += totalsTeam.matrix[pname]?.[u.id]?.totalMs || 0;
+                          for (const u of state.users) sum += totalsTeam.matrix[pname]?.[u.id]?.workMs || 0;
                           return sum === 0;
                         }) && (
                           <tr>
-                            <td colSpan={4} className="muted small">
+                            <td colSpan={2} className="muted small">
                               Nessun dato nel periodo.
                             </td>
                           </tr>
@@ -1359,21 +1300,25 @@ export default function App() {
                         <tr>
                           <th>Progetto</th>
                           {state.users.map((u) => (
-                            <th key={u.id} className="num">{u.name}</th>
+                            <th key={u.id} className="num">
+                              {u.name}
+                            </th>
                           ))}
                           <th className="num">Totale</th>
                         </tr>
                       </thead>
                       <tbody>
                         {projectNameUniverse.map((pname) => {
-                          const cells = state.users.map((u) => totalsTeam.matrix[pname]?.[u.id]?.totalMs || 0);
+                          const cells = state.users.map((u) => totalsTeam.matrix[pname]?.[u.id]?.workMs || 0);
                           const rowSum = cells.reduce((a, b) => a + b, 0);
                           if (!rowSum) return null;
                           return (
                             <tr key={pname}>
                               <td className="truncate">{pname}</td>
                               {cells.map((ms, idx) => (
-                                <td key={state.users[idx].id} className="num">{msToHhMm(ms)}</td>
+                                <td key={state.users[idx].id} className="num">
+                                  {msToHhMm(ms)}
+                                </td>
                               ))}
                               <td className="num strong">{msToHhMm(rowSum)}</td>
                             </tr>
@@ -1381,7 +1326,7 @@ export default function App() {
                         })}
                         {projectNameUniverse.every((pname) => {
                           let sum = 0;
-                          for (const u of state.users) sum += totalsTeam.matrix[pname]?.[u.id]?.totalMs || 0;
+                          for (const u of state.users) sum += totalsTeam.matrix[pname]?.[u.id]?.workMs || 0;
                           return sum === 0;
                         }) && (
                           <tr>
@@ -1405,54 +1350,38 @@ export default function App() {
                 </div>
                 <div className="pdfTotals">
                   <div className="pdfTotalRow">
-                    <span className="muted">Lavoro</span>
-                    <span className="strong">{msToHhMm(totalsMe.totalWorkMs)}</span>
-                  </div>
-                  <div className="pdfTotalRow">
-                    <span className="muted">Trasferta</span>
-                    <span className="strong">{msToHhMm(totalsMe.totalTravelMs)}</span>
-                  </div>
-                  <div className="pdfTotalRow">
                     <span className="muted">Totale</span>
-                    <span className="strong">{msToHhMm(totalsMe.totalMs)}</span>
+                    <span className="strong">{msToHhMm(totalsMe.totalWorkMs)}</span>
                   </div>
                 </div>
               </div>
 
               <div className={compact ? "pdfList compact" : "pdfList"}>
                 {currentProjects.map((p) => {
-                  const b = getDisplayBuckets(currentUser.id, selectedDate, p.id);
+                  const b = getDisplayWork(currentUser.id, selectedDate, p.id);
                   const isActive = activeForCurrentUser.projectId === p.id && !!activeForCurrentUser.startedAt;
-                  const activeMode = isActive ? activeForCurrentUser.mode : null;
+                  const entry = getEntry(currentUser.id, selectedDate, p.id);
 
                   return (
                     <div key={p.id} className={isActive ? "pdfRow active" : "pdfRow"}>
                       <div className="pdfLeft">
-                        <div className="pdfProjName">{p.name}</div>
+                        <div className="pdfProjName">
+                          {p.name} {entry.travel ? <span className="badge mini">TRASFERTA</span> : null}
+                        </div>
                         <div className="pdfMeta">
-                          <span className="pill">Lavoro: {msToHhMm(b.workMs)}</span>
-                          <span className="pill">Trasferta: {msToHhMm(b.travelMs)}</span>
-                          <span className="pill strong">Totale: {msToHhMm(b.totalMs)}</span>
+                          <span className="pill strong">Totale: {msToHhMm(b.workMs)}</span>
                         </div>
                       </div>
 
-                      <div className="pdfBtns">
-                        <button
-                          className={isActive && activeMode === "work" ? "bigBtn on" : "bigBtn"}
-                          onClick={() => startProject(p.id, "work")}
-                          type="button"
-                        >
-                          <StopWatchIcon filled={isActive && activeMode === "work"} />
+                      <div className="pdfBtns oneCol">
+                        <button className={isActive ? "bigBtn on" : "bigBtn"} onClick={() => startProject(p.id)} type="button">
+                          <StopWatchIcon filled={isActive} />
                           <div className="bigLabel">Lavoro</div>
                         </button>
 
-                        <button
-                          className={isActive && activeMode === "travel" ? "bigBtn on" : "bigBtn"}
-                          onClick={() => startProject(p.id, "travel")}
-                          type="button"
-                        >
+                        <button className={entry.travel ? "bigBtn on" : "bigBtn"} onClick={() => toggleTrasfertaMemo(currentUser.id, selectedDate, p.id)} type="button">
                           <FlagStopIcon />
-                          <div className="bigLabel">Trasferta</div>
+                          <div className="bigLabel">Trasferta (memo)</div>
                         </button>
                       </div>
 
@@ -1461,11 +1390,7 @@ export default function App() {
                           <div className="editBlock">
                             <div className="editLabel">Minuti lavoro</div>
                             <div className="editRow">
-                              <button
-                                className="mini"
-                                disabled={isActive}
-                                onClick={() => bumpMs(currentUser.id, selectedDate, p.id, -15 * 60000, "work")}
-                              >
+                              <button className="mini" disabled={isActive} onClick={() => bumpMs(currentUser.id, selectedDate, p.id, -15 * 60000)}>
                                 −15
                               </button>
                               <input
@@ -1478,45 +1403,11 @@ export default function App() {
                                   updateEntry(currentUser.id, selectedDate, p.id, { workMs: minutesIntToMs(v) });
                                 }}
                               />
-                              <button
-                                className="mini"
-                                disabled={isActive}
-                                onClick={() => bumpMs(currentUser.id, selectedDate, p.id, 15 * 60000, "work")}
-                              >
+                              <button className="mini" disabled={isActive} onClick={() => bumpMs(currentUser.id, selectedDate, p.id, 15 * 60000)}>
                                 +15
                               </button>
                             </div>
                             {isActive && <div className="muted tiny">🔒 bloccato mentre il timer è attivo</div>}
-                          </div>
-
-                          <div className="editBlock">
-                            <div className="editLabel">Minuti trasferta</div>
-                            <div className="editRow">
-                              <button
-                                className="mini"
-                                disabled={isActive}
-                                onClick={() => bumpMs(currentUser.id, selectedDate, p.id, -15 * 60000, "travel")}
-                              >
-                                −15
-                              </button>
-                              <input
-                                className="minutes"
-                                inputMode="numeric"
-                                value={String(msToMinutesInt(getEntry(currentUser.id, selectedDate, p.id).travelMs))}
-                                disabled={isActive}
-                                onChange={(e) => {
-                                  const v = Number(digitsOnly(e.target.value));
-                                  updateEntry(currentUser.id, selectedDate, p.id, { travelMs: minutesIntToMs(v) });
-                                }}
-                              />
-                              <button
-                                className="mini"
-                                disabled={isActive}
-                                onClick={() => bumpMs(currentUser.id, selectedDate, p.id, 15 * 60000, "travel")}
-                              >
-                                +15
-                              </button>
-                            </div>
                           </div>
 
                           <div className="editBlock wide">
@@ -1543,16 +1434,8 @@ export default function App() {
               <div className="sectionTitle">Dettagli • {viewRange.label}</div>
               <div className="kv">
                 <div className="kvRow">
-                  <span className="muted">Lavoro</span>
-                  <span>{msToHhMm(totalsMe.totalWorkMs)}</span>
-                </div>
-                <div className="kvRow">
-                  <span className="muted">Trasferta</span>
-                  <span>{msToHhMm(totalsMe.totalTravelMs)}</span>
-                </div>
-                <div className="kvRow">
                   <span className="muted">Totale</span>
-                  <span className="strong">{msToHhMm(totalsMe.totalMs)}</span>
+                  <span className="strong">{msToHhMm(totalsMe.totalWorkMs)}</span>
                 </div>
               </div>
 
@@ -1561,33 +1444,31 @@ export default function App() {
                   <thead>
                     <tr>
                       <th>Progetto</th>
-                      <th className="num">Lavoro</th>
-                      <th className="num">Trasferta</th>
+                      <th>Trasferta</th>
                       <th className="num">Totale</th>
                     </tr>
                   </thead>
                   <tbody>
                     {currentProjects.map((p) => {
                       let w = 0;
-                      let t = 0;
+                      let anyTravel = false;
                       for (const d of totalsMe.dates) {
-                        const b = getDisplayBuckets(currentUser.id, d, p.id);
+                        const b = getDisplayWork(currentUser.id, d, p.id);
                         w += b.workMs;
-                        t += b.travelMs;
+                        const e = getEntry(currentUser.id, d, p.id);
+                        if (e.travel) anyTravel = true;
                       }
-                      const tot = w + t;
                       return (
                         <tr key={p.id}>
                           <td className="truncate">{p.name}</td>
-                          <td className="num">{msToHhMm(w)}</td>
-                          <td className="num">{msToHhMm(t)}</td>
-                          <td className="num strong">{msToHhMm(tot)}</td>
+                          <td>{anyTravel ? "SI" : "NO"}</td>
+                          <td className="num strong">{msToHhMm(w)}</td>
                         </tr>
                       );
                     })}
                     {currentProjects.length === 0 && (
                       <tr>
-                        <td colSpan={4} className="muted small">
+                        <td colSpan={3} className="muted small">
                           Nessun progetto.
                         </td>
                       </tr>
@@ -1605,13 +1486,7 @@ export default function App() {
           <div className="box">
             <div className="boxTitle">Progetti ({titleUser})</div>
             <div className="row">
-              <input
-                ref={newProjectRef}
-                className="input"
-                value={newProjectName}
-                onChange={(e) => setNewProjectName(e.target.value)}
-                placeholder="Nuovo progetto…"
-              />
+              <input ref={newProjectRef} className="input" value={newProjectName} onChange={(e) => setNewProjectName(e.target.value)} placeholder="Nuovo progetto…" />
               <button className="btn" onClick={addProject} disabled={!newProjectName.trim() || scope === "all"}>
                 Aggiungi
               </button>
@@ -1632,12 +1507,7 @@ export default function App() {
           <div className="box">
             <div className="boxTitle">Collaboratori</div>
             <div className="row">
-              <input
-                className="input"
-                value={newUserName}
-                onChange={(e) => setNewUserName(e.target.value)}
-                placeholder="Nome collaboratore…"
-              />
+              <input className="input" value={newUserName} onChange={(e) => setNewUserName(e.target.value)} placeholder="Nome collaboratore…" />
               <button className="btn" onClick={addUser} disabled={!newUserName.trim()}>
                 Aggiungi
               </button>
@@ -1661,16 +1531,8 @@ export default function App() {
             <div className="boxTitle">Riepilogo ({viewRange.label})</div>
             <div className="kv">
               <div className="kvRow">
-                <span className="muted">Lavoro</span>
-                <span>{scope === "all" ? msToHhMm(totalsTeam.grandWorkMs) : msToHhMm(totalsMe.totalWorkMs)}</span>
-              </div>
-              <div className="kvRow">
-                <span className="muted">Trasferta</span>
-                <span>{scope === "all" ? msToHhMm(totalsTeam.grandTravelMs) : msToHhMm(totalsMe.totalTravelMs)}</span>
-              </div>
-              <div className="kvRow">
                 <span className="muted">Totale</span>
-                <span className="strong">{scope === "all" ? msToHhMm(totalsTeam.grandTotalMs) : msToHhMm(totalsMe.totalMs)}</span>
+                <span className="strong">{scope === "all" ? msToHhMm(totalsTeam.grandWorkMs) : msToHhMm(totalsMe.totalWorkMs)}</span>
               </div>
             </div>
           </div>
@@ -1707,12 +1569,7 @@ export default function App() {
 
             <label className="field full">
               <span>Intervallo pull (sec)</span>
-              <input
-                className="input"
-                inputMode="numeric"
-                value={String(sync.autoPullIntervalSec)}
-                onChange={(e) => setSync((c) => ({ ...c, autoPullIntervalSec: Number(digitsOnly(e.target.value || "20")) || 20 }))}
-              />
+              <input className="input" inputMode="numeric" value={String(sync.autoPullIntervalSec)} onChange={(e) => setSync((c) => ({ ...c, autoPullIntervalSec: Number(digitsOnly(e.target.value || "20")) || 20 }))} />
             </label>
 
             <div className="row">
@@ -1734,9 +1591,7 @@ export default function App() {
             </div>
 
             <hr className="sep" />
-            <div className="muted small">
-              PWA: su iPhone apri in Safari → Condividi → Aggiungi a Home. Su Android: menu browser → Installa app.
-            </div>
+            <div className="muted small">PWA: su iPhone apri in Safari → Condividi → Aggiungi a Home. Su Android: menu browser → Installa app.</div>
           </div>
         </aside>
       </main>
@@ -1752,7 +1607,7 @@ const styles = `
     --border: #e5e7eb;
     --muted: #6b7280;
     --text: #111827;
-    --accent: #a88a6b; /* beige-marrone come PDF */
+    --accent: #a88a6b;
     --accent2: rgba(168, 138, 107, 0.10);
   }
   * { box-sizing: border-box; }
@@ -1826,13 +1681,8 @@ const styles = `
   .strong { font-weight: 750; }
   .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; }
 
-  .grid {
-    display: grid;
-    gap: 12px;
-  }
-  @media (min-width: 900px) {
-    .grid { grid-template-columns: 2fr 1fr; }
-  }
+  .grid { display: grid; gap: 12px; }
+  @media (min-width: 900px) { .grid { grid-template-columns: 2fr 1fr; } }
 
   .card {
     border: 1px solid var(--border);
@@ -1843,9 +1693,7 @@ const styles = `
   }
 
   .span2 { grid-column: 1 / -1; }
-  @media (min-width: 900px) {
-    .span2 { grid-column: auto; }
-  }
+  @media (min-width: 900px) { .span2 { grid-column: auto; } }
 
   .sectionTitle { font-weight: 800; margin-bottom: 10px; }
 
@@ -1897,6 +1745,7 @@ const styles = `
   .pill { font-size: 12px; padding: 4px 10px; border-radius: 999px; border: 1px solid var(--border); background: rgba(17,24,39,0.02); }
 
   .pdfBtns { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  .pdfBtns.oneCol { grid-template-columns: 1fr 1fr; }
   .bigBtn {
     border: 1px solid rgba(168, 138, 107, 0.45);
     background: rgba(168, 138, 107, 0.06);
@@ -1952,11 +1801,9 @@ const styles = `
 
   try {
     console.assert(pad2(1) === "01", "pad2 failed");
-
     console.assert(msToHhMm(0) === "0h 00m", "msToHhMm(0) failed");
     console.assert(msToHhMm(61 * 60000) === "1h 01m", "msToHhMm(61m) failed");
 
-    // CSV escaping tests (regression for unterminated regex/string bugs)
     console.assert(csvEscape("plain") === "plain", "csvEscape plain failed");
     console.assert(csvEscape('a"b') === '"a""b"', "csvEscape quote failed");
     console.assert(csvEscape("a,b") === '"a,b"', "csvEscape comma failed");
